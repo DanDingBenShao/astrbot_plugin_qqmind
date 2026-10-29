@@ -34,8 +34,10 @@ from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
                    keyword_wake_enabled, normalize_preset,
                    parse_judge_verdict, parse_time_query,
                    preset_memory_mode, resolve_read_mode, split_bubbles)
+from .core.diagnostics import build_diagnostics
+from .core import diagnostics
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _DIARY_CMD_RE = re.compile(r'<查日记"([^"]{1,60})">')
@@ -87,6 +89,7 @@ class QQMindPlugin(star.Star):
         usage_dir = self._abs_dir("usage_dir", "qqmind_usage")
         self.budget = DailyBudget(os.path.join(usage_dir, "daily.json"), 0)
         self._hist_lock = asyncio.Lock()
+        self._ring = diagnostics.attach(logger)
         self._register_page_apis()
 
     # ---------- 配置与存储路径 ----------
@@ -992,6 +995,9 @@ class QQMindPlugin(star.Star):
         for cs in self._chapters.values():
             cs.close()
         self._chapters.clear()
+        if getattr(self, "_ring", None):
+            diagnostics.detach(logger, self._ring)
+            self._ring = None
 
     # ---------- 配置页后端 API（views/console 通过面板桥调用） ----------
     _STATS = {"judged": 0, "blocked": 0, "replied": 0, "judge_think": 0,
@@ -1040,6 +1046,13 @@ class QQMindPlugin(star.Star):
             except Exception as e:
                 logger.warning(f"[qqmind] save_config failed: {e!r}")
             return {"status": "ok"}
+
+        async def api_diagnostics():
+            try:
+                return {"status": "ok", "data": self._diagnostics_snapshot()}
+            except Exception as e:
+                logger.warning(f"[qqmind] diagnostics failed: {e!r}")
+                return {"status": "error", "message": repr(e)}
 
         async def api_diaries():
             import time as _t
@@ -1159,12 +1172,81 @@ class QQMindPlugin(star.Star):
         self.context.register_web_api(
             f"/{PLUGIN_NAME}/chapter/delete", api_chapter_delete, ["POST"],
             "qqmind 删篇章")
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/diagnostics", api_diagnostics, ["GET"],
+            "qqmind 一键诊断包")
+
+    def _diagnostics_snapshot(self) -> dict:
+        """组装诊断包（WebUI 与命令共用）。隐私：日记正文不出包。"""
+        diary_dir = self._abs_dir("diaries_dir", "qqmind_diaries")
+        diary_total = 0
+        try:
+            for fn in os.listdir(diary_dir):
+                if fn.endswith(".db") and fn[:-3].isdigit():
+                    diary_total += 1
+        except OSError:
+            pass
+        runtime = {
+            "stats": dict(self._STATS),
+            "degraded_groups": sorted(self._degraded),
+            "judge_fail_counts": dict(self._judge_fail),
+            "active_sessions": len(self.sessions),
+            "group_runtimes": len(self._runtime),
+            "diary_files": diary_total,
+            "budget": self._budget().snapshot(),
+        }
+        provider = self.context.get_using_provider() if self.context else None
+        model = ""
+        if provider is not None:
+            try:
+                model = provider.get_model() or ""
+            except Exception:
+                model = ""
+        ab_ver = ""
+        try:
+            from importlib.metadata import version as _pkgver
+            ab_ver = _pkgver("astrbot")
+        except Exception:
+            ab_ver = ""
+        return build_diagnostics(
+            plugin_version=PLUGIN_VERSION,
+            astrbot_version=ab_ver,
+            platform="aiocqhttp",
+            provider_model=model,
+            config={k: self._cfg(k) for k in diagnostics.DIAG_CONFIG_KEYS
+                    if k != "allowed_groups_count"},
+            stats=dict(self._STATS),
+            runtime=runtime,
+            log_lines=self._ring.snapshot() if self._ring else [],
+        )
 
     # ---------- 指令 ----------
     @filter.command("qqmind")
     async def cmd_qqmind(self, event: AstrMessageEvent):
-        """查看插件状态与记忆账本。"""
+        """查看插件状态与记忆账本。带「诊断」参数时输出排障摘要。"""
         uid = int(event.get_sender_id() or 0)
+        arg = (event.message_str or "").strip()
+        if arg in ("诊断", "diag", "诊断包"):
+            d = self._diagnostics_snapshot()
+            st = d["runtime"]["stats"]
+            degraded = d["runtime"]["degraded_groups"]
+            yield event.plain_result(
+                f"qqmind 诊断 v{PLUGIN_VERSION}\n"
+                f"套餐：{d['config'].get('group_preset')} | 读取："
+                f"{d['config'].get('read_mode')} | 判读范围："
+                f"{'全群' if d['config'].get('judge_scope') else '监控期'}\n"
+                f"判读模型：{d['config'].get('judge_model') or '主模型'}"
+                f" | 思考模型：{d['config'].get('think_model') or '未配'}\n"
+                f"计数：判读{st['judged']} 拦截{st['blocked']} "
+                f"回复{st['replied']} 思考轮{st['judge_think']} "
+                f"限流弃{st['dropped_rate']} 预算弃{st['dropped_budget']}\n"
+                f"降级群：{('、'.join(map(str, degraded)) if degraded else '无')}"
+                f" | 判读失败计数：{d['runtime']['judge_fail_counts'] or '无'}\n"
+                f"今日额度：{d['runtime']['budget']['used']}/"
+                f"{d['runtime']['budget']['limit'] or '不限'}\n"
+                f"最近日志：{len(d['logs'])} 条在环形缓冲"
+                f"（完整诊断包请从 WebUI 控制台导出）")
+            return
         n_mem = len(self.memories)
         n_priv = len(self.privates)
         diaries = self.privates[uid].diary.count() if uid in self.privates else 0
@@ -1178,7 +1260,8 @@ class QQMindPlugin(star.Star):
             f"私聊会话：{n_priv} 人\n"
             f"你的日记：{diaries} 篇\n"
             f"{budget_line}\n"
-            f"判读门：{'开' if self._cfg('reply_judge_enabled', True) else '关'}")
+            f"判读门：{'开' if self._cfg('reply_judge_enabled', True) else '关'}"
+            f"\n排障：/qqmind 诊断")
 
     @filter.command("日记")
     async def cmd_diary(self, event: AstrMessageEvent):

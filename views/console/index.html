@@ -291,6 +291,7 @@
     <label>额度用完时在群里说的话</label>
     <input type="text" id="quota-msg" placeholder="今天的额度用完啦，明天再来找我吧～">
     <button class="save" id="save-group">保存群聊设置</button>
+    <button class="ghost" id="export-diag" title="导出脱敏诊断包（不含日记正文，消息原话截断），报障时粘贴到 issue">导出诊断包</button>
     <div class="msg" id="group-msg"></div>
   </div>
 </div>
@@ -641,6 +642,28 @@
         : `今日已用 ${b.used || 0} token（未设上限）`;
     } catch (e) { $('group-msg').textContent = '保存失败：' + e.message; }
     $('save-group').disabled = false;
+  };
+
+  // 导出诊断包（脱敏 JSON，报障时粘贴到 GitHub issue）
+  $('export-diag').onclick = async () => {
+    const btn = $('export-diag');
+    btn.disabled = true;
+    try {
+      const r = await api.apiGet('diagnostics');
+      if (!r || r.status !== 'ok') throw new Error((r && r.message) || '接口失败');
+      const blob = new Blob([JSON.stringify(r.data, null, 1)],
+                            {type: 'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `qqmind-diag-${r.data.environment.plugin_version}-`
+                 + new Date().toISOString().slice(0, 16).replaceAll(':', '') + '.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      $('group-msg').textContent = '诊断包已下载（已脱敏），报障请连同 issue 模板一起提交';
+    } catch (e) {
+      $('group-msg').textContent = '导出失败：' + e.message;
+    }
+    btn.disabled = false;
   };
 
   // ---------------- 人设 ----------------

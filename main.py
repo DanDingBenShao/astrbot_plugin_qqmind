@@ -37,7 +37,7 @@ from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
 from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 
-PLUGIN_VERSION = "0.2.1"
+PLUGIN_VERSION = "0.2.2"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -1286,28 +1286,26 @@ class QQMindPlugin(star.Star):
             f"判读门：{'开' if self._cfg('reply_judge_enabled', True) else '关'}"
             f"\n排障：/qqmind 诊断")
 
-    @filter.command("账单")
-    async def cmd_bill(self, event: AstrMessageEvent):
-        """省钱账单：展示判读门今天帮大家省了多少 token（群私都可看）。"""
+    @filter.llm_tool(name="get_usage_stats")
+    async def tool_usage_stats(self, event: AstrMessageEvent):
+        """查询机器人今天的运行账单：读了多少条群消息、回复了多少条、共消耗多少 token。
+
+        当群友问「今天读了多少」「回了几条」「用了多少 token」「省了多少」
+        这类问题时先调用本工具，再用结果自然地回答。
+        """
         s = self._STATS
         b = self._budget().snapshot()
-        judge_cost = s["judge_in"] + s["judge_out"]
-        saved = max(0, s["saved_in"])
-        net = saved - judge_cost
-        n_replied = s["replied"]
-        lines = [
-            f"🐋 小肥鱼今日账单（{b['day']}）",
-            f"拦下闲聊：{s['blocked']} 条（没让大模型看见）",
-            f"判读开销：{judge_cost} token（每次只花一点点）",
-            f"帮大家省下：约 {saved} token 的回复开销",
-        ]
-        if judge_cost > 0:
-            lines.append(f"净省：约 {net} token"
-                         f"（省的 ÷ 判读花的 = {saved / max(1, judge_cost):.1f} 倍）")
-        lines.append(f"实际回复：{n_replied} 条 | 全天总消耗：{b['used']} token")
-        pct = (saved / (b['used'] + saved) * 100) if (b['used'] + saved) > 0 else 0
-        lines.append(f"相当于比无脑全回省了 {pct:.0f}% 💙")
-        yield event.plain_result("\n".join(lines))
+        return (f"今日（{b['day']}）账单：读 {s['judged']} 条，"
+                f"回 {s['replied']} 条，共消耗 {b['used']} token。")
+
+    @filter.command("账单")
+    async def cmd_bill(self, event: AstrMessageEvent):
+        """今日账单：三个数（读了/回了/总 token），群私都可看。"""
+        s = self._STATS
+        b = self._budget().snapshot()
+        yield event.plain_result(
+            f"🐋 今日账单（{b['day']}）：读 {s['judged']} 条 · 回 {s['replied']} 条"
+            f" · 用了 {b['used']} token")
 
     @filter.command("日记")
     async def cmd_diary(self, event: AstrMessageEvent):

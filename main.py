@@ -37,8 +37,11 @@ from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
 from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.1"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
+
+_PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
+JUDGE_PROMPT_LEN = est_tokens(JUDGE_PROMPT)   # 判读 system 提示词的 token 数（账单口径）
 
 _DIARY_CMD_RE = re.compile(r'<查日记"([^"]{1,60})">')
 _GROUP_DIARY_CMD_RE = re.compile(r'<查群日记"([^"]{1,60})">')
@@ -59,6 +62,7 @@ _CONFIG_KEYS = (
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "history_rounds", "max_msg_tokens",
     "daily_token_budget", "quota_message", "quota_notices_per_day",
+    "bill_est_reply_tokens",
 )
 
 
@@ -661,6 +665,7 @@ class QQMindPlugin(star.Star):
             return
         if not ok:
             self._STATS["blocked"] += 1
+            self._bill_saved(1)
             s.rounds_left -= 1
             if s.rounds_left <= 0:
                 self.sessions.pop(key, None)
@@ -701,6 +706,7 @@ class QQMindPlugin(star.Star):
         self._STATS["judged"] += 1
         if not ok:
             self._STATS["blocked"] += 1
+            self._bill_saved(1)
             event.should_call_llm(True)
             return
         if not self._allow_reply(gid):
@@ -772,6 +778,10 @@ class QQMindPlugin(star.Star):
         self._degraded.discard(gid)
         ok, think = verdict
         self._STATS["judge_think"] += int(think)
+        # 账单：判读侧真实消耗（system+ask+输出）。拦截计数由调用方负责，
+        # 这里不记 blocked/saved，避免全量档/监控期两路重复计账
+        self._STATS["judge_in"] += est_tokens(ask) + JUDGE_PROMPT_LEN
+        self._STATS["judge_out"] += est_tokens(out_text)
         logger.info(f"[qqmind] judge -> {'是|思考' if think else ('是|直接' if ok else '否')}: {pending[:40]}")
         return ok, think
 
@@ -1001,7 +1011,20 @@ class QQMindPlugin(star.Star):
 
     # ---------- 配置页后端 API（views/console 通过面板桥调用） ----------
     _STATS = {"judged": 0, "blocked": 0, "replied": 0, "judge_think": 0,
-              "dropped_rate": 0, "dropped_budget": 0}
+              "dropped_rate": 0, "dropped_budget": 0,
+              "judge_in": 0, "judge_out": 0, "saved_in": 0}
+
+    def _bill_saved(self, n_blocked: int) -> None:
+        """拦截即省钱：被拦消息按「本来要一次完整回复」估算省下的输入量。
+
+        口径（诚实基准）：单次回复均价 = 群聊 system 提示词 + 窗口上下文
+        （用本群最近一次真实回复的计账，没有则用保守常数）。只算输入侧，
+        输出侧省的是一次回复文本——不夸大。
+        """
+        if n_blocked <= 0:
+            return
+        per_reply = int(self._cfg("bill_est_reply_tokens", 650))
+        self._STATS["saved_in"] += n_blocked * per_reply
 
     def _register_page_apis(self):
         """注册 views/console 页面用的后端接口（面板同源鉴权）。"""
@@ -1262,6 +1285,29 @@ class QQMindPlugin(star.Star):
             f"{budget_line}\n"
             f"判读门：{'开' if self._cfg('reply_judge_enabled', True) else '关'}"
             f"\n排障：/qqmind 诊断")
+
+    @filter.command("账单")
+    async def cmd_bill(self, event: AstrMessageEvent):
+        """省钱账单：展示判读门今天帮大家省了多少 token（群私都可看）。"""
+        s = self._STATS
+        b = self._budget().snapshot()
+        judge_cost = s["judge_in"] + s["judge_out"]
+        saved = max(0, s["saved_in"])
+        net = saved - judge_cost
+        n_replied = s["replied"]
+        lines = [
+            f"🐋 小肥鱼今日账单（{b['day']}）",
+            f"拦下闲聊：{s['blocked']} 条（没让大模型看见）",
+            f"判读开销：{judge_cost} token（每次只花一点点）",
+            f"帮大家省下：约 {saved} token 的回复开销",
+        ]
+        if judge_cost > 0:
+            lines.append(f"净省：约 {net} token"
+                         f"（省的 ÷ 判读花的 = {saved / max(1, judge_cost):.1f} 倍）")
+        lines.append(f"实际回复：{n_replied} 条 | 全天总消耗：{b['used']} token")
+        pct = (saved / (b['used'] + saved) * 100) if (b['used'] + saved) > 0 else 0
+        lines.append(f"相当于比无脑全回省了 {pct:.0f}% 💙")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("日记")
     async def cmd_diary(self, event: AstrMessageEvent):

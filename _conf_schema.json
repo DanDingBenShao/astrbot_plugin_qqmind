@@ -89,7 +89,7 @@
     "default": false,
     "hint": "关闭时，随机读只在有人 @/关键词唤醒后的监控期内工作"
   },
-    "judge_model": {
+  "judge_model": {
     "description": "判读用模型（留空=主模型；推荐填无思考模型，判读快且省）",
     "type": "string",
     "default": "",
@@ -101,7 +101,7 @@
     "default": "",
     "hint": "如 deepseek-reasoner；主模型名以 -nothink 结尾时自动去掉后缀"
   },
-"reply_judge_enabled": {
+  "reply_judge_enabled": {
     "description": "判读门：读到的消息先判是否在对机器人说",
     "type": "bool",
     "default": true,
@@ -134,6 +134,12 @@
     "description": "额度提示每群每天最多几次",
     "type": "int",
     "default": 2
+  },
+  "bill_est_reply_tokens": {
+    "description": "账单估算：单次完整回复平均 token 数（用于计算拦下省了多少）",
+    "type": "int",
+    "default": 650,
+    "hint": "统计展示用，不影响实际行为；分层/全量档建议 800-1500"
   },
   "judge_fail_threshold": {
     "description": "判读连续失败几次自动降级轻量（等下一条@恢复）",

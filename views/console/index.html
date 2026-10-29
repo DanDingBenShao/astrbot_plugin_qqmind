@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>群聊记忆体 · 控制台</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --line: #e5e7eb;
+    --text: #1f2937; --muted: #6b7280; --accent: #4f7cf0;
+    --danger: #d9534f;
+  }
+  [data-theme="dark"] {
+    --bg: #17181c; --card: #22242a; --line: #33363e;
+    --text: #e5e7eb; --muted: #9ca3af; --accent: #6b93f5;
+    --danger: #e06c68;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; background: var(--bg);
+         color: var(--text); padding: 20px 24px; }
+  .tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--line); margin-bottom: 20px; }
+  .tab { padding: 10px 22px; font-size: 15px; cursor: pointer; color: var(--muted);
+         border: none; background: none; border-bottom: 2px solid transparent;
+         margin-bottom: -2px; }
+  .tab.on { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .pane { display: none; max-width: 980px; }
+  .pane.on { display: block; }
+  h3 { font-size: 14px; color: var(--muted); font-weight: 500; margin-bottom: 12px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+  input[type=number], input[type=text], textarea, select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--text); font-size: 14px; }
+  input[type=number] { width: 160px; }
+  textarea { min-height: 90px; resize: vertical; font-family: inherit; }
+  button.save { margin-top: 14px; padding: 8px 20px; border: none; border-radius: 8px;
+    background: var(--accent); color: #fff; font-size: 14px; cursor: pointer; }
+  button.ghost { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--text); font-size: 13px; cursor: pointer; }
+  button.ghost:disabled, button.save:disabled { opacity: .5; cursor: default; }
+  button.danger { color: var(--danger); border-color: var(--danger); }
+  .msg { margin-top: 8px; font-size: 13px; color: var(--muted); min-height: 18px; }
+  .list { display: flex; flex-direction: column; gap: 2px; }
+  .user { display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+  .user:hover { background: var(--card); }
+  .user .n { color: var(--muted); font-size: 13px; }
+  .back { font-size: 13px; color: var(--accent); cursor: pointer; margin-bottom: 10px;
+    display: inline-block; }
+  .entry { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    margin-bottom: 8px; overflow: hidden; }
+  .entry .head { padding: 10px 14px; cursor: pointer; display: flex;
+    justify-content: space-between; align-items: center; gap: 10px; }
+  .entry .head:hover { opacity: .85; }
+  .entry .time { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .entry .ttl { font-size: 14px; flex: 1; }
+  .entry .arrow { color: var(--muted); font-size: 12px; }
+  .entry .body { display: none; padding: 0 14px 12px; font-size: 13px;
+    line-height: 1.7; color: var(--muted); }
+  .entry.open .body { display: block; }
+  .entry .body .tags { color: var(--accent); margin-bottom: 4px; }
+  .entry .body .meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 14px; }
+  .card h4 { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+  .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .row > .field { flex: 1; min-width: 140px; }
+  .field label { margin-top: 0; }
+  .presets { display: flex; gap: 8px; flex-wrap: wrap; }
+  .preset { padding: 9px 16px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--text); font-size: 14px; cursor: pointer; }
+  .preset.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .switch { display: flex; align-items: center; gap: 8px; font-size: 14px;
+    margin: 8px 0; cursor: pointer; }
+  .switch input { width: 16px; height: 16px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 999px; background: var(--bg); border: 1px solid var(--line);
+    font-size: 13px; }
+  .chip b { color: var(--accent); font-weight: 500; }
+  .chip .x { cursor: pointer; color: var(--muted); }
+  .break { height: 1px; background: var(--line); margin: 16px 0; }
+
+  /* 人设页：折叠层 + 展开大编辑区 */
+  #p3 { max-width: 980px; }
+  .card-head { display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; margin-bottom: 8px; }
+  .card-head h4 { margin-bottom: 0; }
+  .acc { border-top: 1px solid var(--line); }
+  .acc:first-of-type { border-top: none; }
+  .acc-head { display: flex; align-items: center; gap: 12px; padding: 12px 2px;
+    cursor: pointer; }
+  .acc-head:hover .acc-name { color: var(--accent); }
+  .acc-name { font-size: 14px; font-weight: 600; white-space: nowrap; }
+  .acc-preview { flex: 1; min-width: 0; font-size: 13px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acc-preview.empty { opacity: .55; }
+  .acc-edit { font-size: 12px; color: var(--accent); white-space: nowrap; }
+  textarea.big { min-height: 220px; line-height: 1.65; }
+
+  /* 人设整页编辑器：覆盖插件页视口 */
+  .editor-overlay { position: fixed; inset: 0; z-index: 100; display: none;
+    flex-direction: column; background: var(--bg); padding: 18px 24px 16px; }
+  .editor-overlay.on { display: flex; }
+  .editor-bar { display: flex; align-items: center; gap: 14px; }
+  .editor-title { flex: 1; font-size: 16px; font-weight: 600; }
+  .editor-bar .save { margin-top: 0; }
+  .editor-text { flex: 1; min-height: 0; margin-top: 10px; resize: none;
+    font-size: 15px; line-height: 1.75; padding: 14px 16px; }
+  .editor-foot { display: flex; justify-content: space-between; align-items: center;
+    margin-top: 10px; }
+  .editor-foot .msg { margin-top: 0; }
+
+  /* 背景故事：角色包 + 篇章折叠编辑 */
+  .pack-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-top: 10px; }
+  .pack-bar select { flex: 1; min-width: 180px; width: auto; }
+  .pack-new { display: flex; gap: 8px; margin-top: 8px; }
+  .pack-new input { flex: 1; }
+  .sec-head { display: flex; justify-content: space-between; align-items: center;
+    gap: 10px; margin-bottom: 8px; }
+  .sec-head h4 { margin-bottom: 0; }
+  .count { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 4px; }
+  .chapter { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px;
+    overflow: hidden; background: var(--bg); }
+  .chapter-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    cursor: pointer; }
+  .chapter-head:hover { background: var(--card); }
+  .chapter-main { flex: 1; min-width: 0; }
+  .chapter-title { font-size: 14px; }
+  .chapter-sub { font-size: 12px; color: var(--muted); margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chapter-chev { width: 7px; height: 7px; flex: none; margin: 0 4px;
+    border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted);
+    transform: rotate(-45deg); transition: transform .15s; }
+  .chapter.open .chapter-chev { transform: rotate(45deg); }
+  .chapter-body { display: none; padding: 10px 12px 14px; border-top: 1px solid var(--line);
+    background: var(--bg); }
+  .chapter.open .chapter-body { display: block; }
+  .chapter-body .field { margin-bottom: 10px; }
+  .chapter-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .chapter-actions .save { margin-top: 0; }
+  .chapter-actions .msg { margin-top: 0; flex: 1; min-width: 120px; }
+</style>
+</head>
+<body>
+<div class="tabs">
+  <button class="tab on" data-pane="p1">一对一对话</button>
+  <button class="tab" data-pane="p2">群聊</button>
+  <button class="tab" data-pane="p3">人设卡</button>
+</div>
+
+<!-- ================= 一对一对话 ================= -->
+<div class="pane on" id="p1">
+  <div id="diary-index">
+    <h3>有日记的用户</h3>
+    <div class="list" id="user-list">加载中…</div>
+  </div>
+  <div id="diary-view" style="display:none">
+    <span class="back" id="back-btn">← 返回列表</span>
+    <h3 id="diary-title">日记</h3>
+    <div id="diary-list"></div>
+  </div>
+  <div style="margin-top:28px">
+    <h3>窗口预算</h3>
+    <label>token 预算（溢出自动压成日记）</label>
+    <input type="number" id="budget" min="2000" max="100000" step="1000">
+    <br>
+    <button class="save" id="save-budget">保存</button>
+    <div class="msg" id="budget-msg"></div>
+  </div>
+</div>
+
+<!-- ================= 群聊 ================= -->
+<div class="pane" id="p2">
+  <div class="card">
+    <h4>今日用量</h4>
+    <div class="hint" id="budget-stat">加载中…</div>
+  </div>
+
+  <div class="card">
+    <h4>套餐</h4>
+    <div class="hint">不知道选哪个就用「轻量」；想让它多接话，再往右选。</div>
+    <div class="presets" id="presets" style="margin-top:10px">
+      <button class="preset" data-preset="light">轻量</button>
+      <button class="preset" data-preset="full">全量</button>
+      <button class="preset" data-preset="layered">分层</button>
+      <button class="preset" data-preset="advanced">高级</button>
+    </div>
+    <div class="hint" id="preset-hint" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card preset-box" id="box-full" style="display:none">
+    <h4>全量模式</h4>
+    <div class="hint">每条群消息都会先判断一次“是不是在跟它说话”，是才回。</div>
+    <div class="field">
+      <label>最多保留多少条群消息原文</label>
+      <input type="number" id="full-window" min="5" max="500">
+    </div>
+  </div>
+
+  <div class="card preset-box" id="box-layered" style="display:none">
+    <h4>分层模式</h4>
+    <div class="hint">近期消息保留原文，更早的自动压成“群日记”，问起旧事还能翻出来。</div>
+    <div class="field">
+      <label>保留多少条原文（超出的压成日记）</label>
+      <input type="number" id="shallow-window" min="4" max="200">
+    </div>
+  </div>
+
+  <div class="card preset-box" id="box-advanced" style="display:none">
+    <div class="hint">一条群消息的流程：先被叫醒 → 决定读不读 → 读进什么记忆 → 决定回不回。</div>
+
+    <h4 style="margin-top:14px">1. 什么时候理人（唤醒）</h4>
+    <div class="hint">被 @ 一定回。下面的关键词只负责“把它叫醒”，回不回还要看第 4 步。@全体成员永远不理。</div>
+    <label>唤醒关键词</label>
+    <div class="chips" id="kw-chips"></div>
+    <div class="row">
+      <div class="field"><input type="text" id="kw-input" placeholder="输入关键词，回车添加"></div>
+      <button class="ghost" id="kw-add">添加</button>
+    </div>
+    <div class="hint" style="margin-top:8px">被 @ 或用关键词叫到后，会开启 5 分钟“接话窗口”：这段时间里，同一个人的后续消息不用再 @ 也会逐条判断；连续 3 次判断都不是在叫它，就自动收口；每回复一次，机会重新计算。</div>
+
+    <div class="break"></div>
+    <h4>2. 怎么读群消息（读取）</h4>
+    <div class="field">
+      <label>读取方式</label>
+      <select id="read-mode">
+        <option value="at_only">只读 @（最省）</option>
+        <option value="full">每条都读（先判断再决定）</option>
+        <option value="batch">攒一会儿再读（合并判断）</option>
+        <option value="random">隔一段时间随机读</option>
+      </select>
+    </div>
+    <div class="hint" id="read-mode-hint"></div>
+    <div id="batch-box" style="display:none;margin-top:8px">
+      <div class="row">
+        <div class="field"><label>等多久没新消息再回（秒）</label><input type="number" id="batch-delay" min="1" max="120"></div>
+        <div class="field"><label>最多合并几条（达到就直接回）</label><input type="number" id="batch-max" min="1" max="100"></div>
+      </div>
+      <div class="hint">每来一条新消息，等待时间重新算；条数达到上限就立刻合并回复。</div>
+    </div>
+    <div id="random-box" style="display:none;margin-top:8px">
+      <div class="row">
+        <div class="field"><label>最短隔多少秒</label><input type="number" id="random-min" min="5"></div>
+        <div class="field"><label>最长隔多少秒</label><input type="number" id="random-max" min="10"></div>
+      </div>
+      <label class="switch"><input type="checkbox" id="roam"> 没被叫时也随机看群</label>
+      <div class="hint">只对“随机读”有效。关闭：只在接话窗口内随机读；打开：机器人一直随机看群，更费 token。</div>
+    </div>
+
+    <div class="break"></div>
+    <h4>3. 记住什么（记忆）</h4>
+    <label class="switch"><input type="checkbox" id="mem-layer"> 分层记忆：近期原文 + 更早的群日记</label>
+    <div class="hint">群里只保留最近一段原文；更早的对话压成“群日记”，问到旧事时按标题找回来。</div>
+    <label class="switch"><input type="checkbox" id="mem-precise"> 精确到人：每个群友单独记忆</label>
+    <div class="hint">给每个 QQ 号单独存一条记忆线，记得“谁说过什么”；比分层记忆更费 token。两个都开时，精确到人优先。</div>
+    <div class="field">
+      <label>精确记忆每人最多多少 token</label>
+      <input type="number" id="precise-budget" min="500" step="500">
+    </div>
+
+    <div class="break"></div>
+    <h4>4. 什么情况下回复（回复）</h4>
+    <label class="switch"><input type="checkbox" id="reply-judge"> 先判断是不是在跟它说话</label>
+    <div class="hint">打开后，普通群消息要先过一道判断，确认在叫它才回；关闭则每条都可能回，容易刷屏。</div>
+    <div class="row">
+      <div class="field"><label>每分钟最多回几条</label><input type="number" id="rate-limit" min="1"></div>
+      <div class="field"><label>每分钟最多判断几条</label><input type="number" id="judge-cap" min="1"></div>
+    </div>
+    <div class="field">
+      <label>后台保留多少条群消息</label>
+      <input type="number" id="group-buffer" min="10" max="500">
+    </div>
+    <div class="hint">只用于判断和随机读的上下文，不会整段塞进模型。</div>
+    <div class="field">
+      <label>不搭理的机器人 QQ（逗号分隔）</label>
+      <input type="text" id="bot-qqs" placeholder="123456, 789012">
+    </div>
+    <div class="hint">避免两个机器人互相接话。</div>
+  </div>
+
+  <div class="card">
+    <h4>护栏</h4>
+    <div class="row">
+      <div class="field"><label>每天最多花多少 token（0 = 不限）</label><input type="number" id="daily-budget" min="0" step="10000"></div>
+      <div class="field"><label>额度用完后，每群每天最多提示几次</label><input type="number" id="quota-notices" min="0" max="10"></div>
+      <div class="field"><label>判断连续失败几次后自动降级</label><input type="number" id="judge-fail" min="1" max="10"></div>
+    </div>
+    <label>额度用完时在群里说的话</label>
+    <input type="text" id="quota-msg" placeholder="今天的额度用完啦，明天再来找我吧～">
+    <button class="save" id="save-group">保存群聊设置</button>
+    <div class="msg" id="group-msg"></div>
+  </div>
+</div>
+
+<!-- ================= 人设卡 ================= -->
+<div class="pane" id="p3">
+  <div class="card">
+    <div class="card-head">
+      <h4>人格三层</h4>
+      <span class="hint">点开任意一层编辑，浅层与深层常驻在每轮对话里</span>
+    </div>
+
+    <div class="acc" id="acc-shallow" data-layer="shallow">
+      <div class="acc-head">
+        <span class="acc-name">浅层</span>
+        <span class="acc-preview empty">未填写</span>
+        <span class="acc-edit">编辑 ›</span>
+      </div>
+    </div>
+
+    <div class="acc" id="acc-deep" data-layer="deep">
+      <div class="acc-head">
+        <span class="acc-name">深层</span>
+        <span class="acc-preview empty">未填写</span>
+        <span class="acc-edit">编辑 ›</span>
+      </div>
+    </div>
+
+    <div class="acc" id="acc-legacy" data-layer="legacy">
+      <div class="acc-head">
+        <span class="acc-name">旧版单卡（备用）</span>
+        <span class="acc-preview empty">未填写</span>
+        <span class="acc-edit">编辑 ›</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h4>背景故事</h4>
+      <span class="hint">一套角色包 = 一个角色的篇章库；标题常驻，命中关键词才带出正文</span>
+    </div>
+
+    <div class="pack-bar">
+      <select id="pack-select"></select>
+      <button class="ghost" id="pack-activate">启用这个包</button>
+      <button class="ghost" id="pack-new-toggle">＋ 新建角色包</button>
+    </div>
+    <div class="pack-new" id="pack-new-row" style="display:none">
+      <input type="text" id="pack-new" placeholder="角色包名，如 胡桃、雷电将军">
+      <button class="ghost" id="pack-create">创建并启用</button>
+      <button class="ghost" id="pack-new-cancel">取消</button>
+    </div>
+    <div class="hint" id="pack-state" style="margin-top:8px">当前启用：无</div>
+
+    <div class="break"></div>
+
+    <div class="sec-head">
+      <h4>篇章<span class="count" id="chapter-count"></span></h4>
+      <button class="ghost" id="ch-add">＋ 新增篇章</button>
+    </div>
+    <div id="chapter-list"><div class="hint">选择或新建角色包后加载。</div></div>
+    <div class="msg" id="ch-msg"></div>
+  </div>
+</div>
+
+<!-- ================= 人设整页编辑器 ================= -->
+<div class="editor-overlay" id="persona-editor">
+  <div class="editor-bar">
+    <button class="ghost" id="editor-back">← 返回</button>
+    <div class="editor-title" id="editor-title">编辑</div>
+    <button class="save" id="editor-save">保存</button>
+  </div>
+  <div class="hint" id="editor-hint" style="margin-top:10px"></div>
+  <textarea class="editor-text" id="editor-text"></textarea>
+  <div class="editor-foot">
+    <span class="hint" id="editor-count"></span>
+    <span class="msg" id="editor-msg"></span>
+  </div>
+</div>
+
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<script>
+(async () => {
+  const $ = (id) => document.getElementById(id);
+  const api = window.AstrBotPluginView || window.AstrBotPluginPage;
+  const D = {
+    group_preset: 'light', wake_keywords: [], group_buffer_size: 60,
+    read_mode: 'batch', random_min_seconds: 20, random_max_seconds: 300,
+    debounce_seconds: 10, batch_max_messages: 10,
+    roam_enabled: false, reply_judge_enabled: true, reply_rate_per_min: 6,
+    max_judged_per_min: 30, judge_fail_threshold: 3, bot_qq_ids: [],
+    group_flat_messages: 60, group_shallow_messages: 20,
+    group_context_messages: 20, memory_layering: true, precise_memory: false,
+    precise_budget_tokens: 4000, daily_token_budget: 0,
+    quota_message: '今天的额度用完啦，明天再来找我吧～',
+    quota_notices_per_day: 2, persona_shallow: '', persona_deep: '',
+    persona_text: '', persona_pack: '', private_budget_tokens: 10000
+  };
+  const state = { cfg: {}, preset: 'light', keywords: [], packs: [],
+                  pack: '', active: '', chapters: [] };
+
+  const val = (k) => (state.cfg[k] === null || state.cfg[k] === undefined)
+    ? D[k] : state.cfg[k];
+  const num = (id) => parseInt($(id).value) || 0;
+
+  document.querySelectorAll('.tab').forEach(t => {
+    t.onclick = () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
+      document.querySelectorAll('.pane').forEach(p =>
+        p.classList.toggle('on', p.id === t.dataset.pane));
+    };
+  });
+
+  // ---------------- 一对一 ----------------
+  async function loadBudget() {
+    try {
+      const cfg = await api.apiGet('config');
+      $('budget').value = cfg.private_budget_tokens ?? 10000;
+    } catch (e) { console.warn(e); }
+  }
+
+  $('save-budget').onclick = async () => {
+    $('save-budget').disabled = true;
+    try {
+      await api.apiPost('config',
+        { private_budget_tokens: parseInt($('budget').value) || 10000 });
+      $('budget-msg').textContent = '已保存 ✓';
+    } catch (e) { $('budget-msg').textContent = '保存失败：' + e.message; }
+    $('save-budget').disabled = false;
+  };
+
+  async function loadUsers() {
+    try {
+      const r = await api.apiGet('sessions');
+      const users = r.users || [];
+      $('user-list').innerHTML = users.length ? '' : '（还没有任何私聊日记）';
+      for (const u of users) {
+        const div = document.createElement('div');
+        div.className = 'user';
+        const left = document.createElement('span');
+        left.textContent = u.uid;
+        const right = document.createElement('span');
+        right.className = 'n';
+        right.textContent = `${u.diaries} 篇日记 · 窗口 ${u.window_tokens} tok`;
+        div.append(left, right);
+        div.onclick = () => openDiary(u.uid);
+        $('user-list').appendChild(div);
+      }
+    } catch (e) { $('user-list').textContent = '加载失败：' + e.message; }
+  }
+
+  async function openDiary(uid) {
+    $('diary-index').style.display = 'none';
+    $('diary-view').style.display = 'block';
+    $('diary-title').textContent = uid + ' 的日记';
+    $('diary-list').innerHTML = '加载中…';
+    try {
+      const r = await api.apiGet('diaries', { uid });
+      const entries = r.entries || [];
+      $('diary-list').innerHTML = '';
+      if (!entries.length) {
+        $('diary-list').textContent = '（没有日记）';
+        return;
+      }
+      for (const e of entries) {
+        const card = document.createElement('div');
+        card.className = 'entry';
+        const head = document.createElement('div');
+        head.className = 'head';
+        const tEl = document.createElement('span');
+        tEl.className = 'time';
+        tEl.textContent = (e.ts || '').split(' ')[0];
+        const sEl = document.createElement('span');
+        sEl.className = 'ttl';
+        sEl.textContent = e.title || e.summary || '';
+        const aEl = document.createElement('span');
+        aEl.className = 'arrow';
+        aEl.textContent = '›';
+        head.append(tEl, sEl, aEl);
+        const body = document.createElement('div');
+        body.className = 'body';
+        const metaEl = document.createElement('div');
+        metaEl.className = 'meta';
+        metaEl.textContent = e.ts || '';
+        const tagsEl = document.createElement('div');
+        tagsEl.className = 'tags';
+        tagsEl.textContent = e.tags ? '标签：' + e.tags : '';
+        const fullEl = document.createElement('div');
+        fullEl.textContent = e.summary || '';
+        body.append(metaEl, tagsEl, fullEl);
+        head.onclick = () => {
+          card.classList.toggle('open');
+          aEl.textContent = card.classList.contains('open') ? '▾' : '›';
+        };
+        card.append(head, body);
+        $('diary-list').appendChild(card);
+      }
+    } catch (e) { $('diary-list').textContent = '加载失败：' + e.message; }
+  }
+
+  $('back-btn').onclick = () => {
+    $('diary-view').style.display = 'none';
+    $('diary-index').style.display = 'block';
+    loadUsers();
+  };
+
+  // ---------------- 群聊 ----------------
+  const PRESET_HINT = {
+    light: '最省。平时只回 @；被 @ 后的 5 分钟内会接着判断几句。',
+    full: '每条群消息都判断一次要不要接话；群记忆全量平铺。',
+    layered: '等群里安静几秒再合并判断；近期原文 + 更早压成群日记。',
+    advanced: '自己调：什么时候理人、怎么读、记什么、什么时候回。'
+  };
+  const READ_HINT = {
+    at_only: '只有 @ 机器人才读消息，其他消息完全不看。',
+    full: '每条群消息都先判断一次是不是在跟它说话，是才回。',
+    batch: '每来一条消息就等设定的秒数；期间有新消息就并进来并重新计时，条数达到上限就立刻回。',
+    random: '每隔一段时间随机看一次；没有新消息就不看。默认只在接话窗口内看，打开下面的开关才会一直看。'
+  };
+
+  function applyPreset() {
+    document.querySelectorAll('.preset').forEach(b =>
+      b.classList.toggle('on', b.dataset.preset === state.preset));
+    $('preset-hint').textContent = PRESET_HINT[state.preset] || '';
+    $('box-full').style.display = state.preset === 'full' ? 'block' : 'none';
+    $('box-layered').style.display = state.preset === 'layered' ? 'block' : 'none';
+    $('box-advanced').style.display = state.preset === 'advanced' ? 'block' : 'none';
+    const mode = $('read-mode').value;
+    $('read-mode-hint').textContent = READ_HINT[mode] || '';
+    $('batch-box').style.display = mode === 'batch' ? 'block' : 'none';
+    $('random-box').style.display = mode === 'random' ? 'block' : 'none';
+  }
+
+  document.querySelectorAll('.preset').forEach(b => {
+    b.onclick = () => { state.preset = b.dataset.preset; applyPreset(); };
+  });
+  $('read-mode').onchange = applyPreset;
+
+  function renderKeywords() {
+    const box = $('kw-chips');
+    box.innerHTML = '';
+    if (!state.keywords.length) {
+      box.innerHTML = '<span class="hint">（还没有关键词）</span>';
+      return;
+    }
+    state.keywords.forEach((k, i) => {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      const t = document.createElement('b');
+      t.textContent = k;
+      const x = document.createElement('span');
+      x.className = 'x';
+      x.textContent = '×';
+      x.onclick = () => { state.keywords.splice(i, 1); renderKeywords(); };
+      chip.append(t, x);
+      box.appendChild(chip);
+    });
+  }
+
+  function addKeyword() {
+    const v = $('kw-input').value.trim();
+    if (!v) return;
+    if (!state.keywords.includes(v)) state.keywords.push(v);
+    $('kw-input').value = '';
+    renderKeywords();
+  }
+  $('kw-add').onclick = addKeyword;
+  $('kw-input').onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addKeyword(); }
+  };
+
+  function fillGroupForm() {
+    state.preset = val('group_preset');
+    state.keywords = Array.isArray(val('wake_keywords'))
+      ? val('wake_keywords').slice() : [];
+    $('full-window').value = val('group_flat_messages');
+    $('shallow-window').value = val('group_shallow_messages');
+    $('read-mode').value = val('read_mode');
+    $('batch-delay').value = val('debounce_seconds');
+    $('batch-max').value = val('batch_max_messages');
+    $('random-min').value = val('random_min_seconds');
+    $('random-max').value = val('random_max_seconds');
+    $('roam').checked = !!val('roam_enabled');
+    $('mem-layer').checked = !!val('memory_layering');
+    $('mem-precise').checked = !!val('precise_memory');
+    $('precise-budget').value = val('precise_budget_tokens');
+    $('reply-judge').checked = !!val('reply_judge_enabled');
+    $('rate-limit').value = val('reply_rate_per_min');
+    $('judge-cap').value = val('max_judged_per_min');
+    $('group-buffer').value = val('group_buffer_size');
+    const bots = val('bot_qq_ids');
+    $('bot-qqs').value = Array.isArray(bots) ? bots.join(', ') : (bots || '');
+    $('daily-budget').value = val('daily_token_budget');
+    $('quota-notices').value = val('quota_notices_per_day');
+    $('judge-fail').value = val('judge_fail_threshold');
+    $('quota-msg').value = val('quota_message');
+    renderKeywords();
+    applyPreset();
+  }
+
+  async function loadGroup() {
+    try {
+      state.cfg = await api.apiGet('config');
+      fillGroupForm();
+      const st = await api.apiGet('stats');
+      const b = st.budget || {};
+      $('budget-stat').textContent = (b.limit > 0)
+        ? `今日已用 ${b.used} / ${b.limit} token（剩余 ${b.remaining}）`
+        : `今日已用 ${b.used || 0} token（未设上限）`;
+    } catch (e) { $('budget-stat').textContent = '加载失败：' + e.message; }
+  }
+
+  $('save-group').onclick = async () => {
+    $('save-group').disabled = true;
+    const payload = {
+      group_preset: state.preset,
+      wake_keywords: state.keywords,
+      group_flat_messages: num('full-window') || D.group_flat_messages,
+      group_shallow_messages: num('shallow-window') || D.group_shallow_messages,
+      read_mode: $('read-mode').value,
+      debounce_seconds: num('batch-delay') || D.debounce_seconds,
+      batch_max_messages: num('batch-max') || D.batch_max_messages,
+      random_min_seconds: num('random-min') || D.random_min_seconds,
+      random_max_seconds: num('random-max') || D.random_max_seconds,
+      roam_enabled: $('roam').checked,
+      memory_layering: $('mem-layer').checked,
+      precise_memory: $('mem-precise').checked,
+      precise_budget_tokens: num('precise-budget') || D.precise_budget_tokens,
+      reply_judge_enabled: $('reply-judge').checked,
+      reply_rate_per_min: num('rate-limit') || D.reply_rate_per_min,
+      max_judged_per_min: num('judge-cap') || D.max_judged_per_min,
+      group_buffer_size: num('group-buffer') || D.group_buffer_size,
+      bot_qq_ids: $('bot-qqs').value.split(/[,，\s]+/).map(x => x.trim()).filter(Boolean),
+      daily_token_budget: num('daily-budget'),
+      quota_notices_per_day: num('quota-notices'),
+      judge_fail_threshold: num('judge-fail') || D.judge_fail_threshold,
+      quota_message: $('quota-msg').value
+    };
+    try {
+      await api.apiPost('config', payload);
+      Object.assign(state.cfg, payload);
+      $('group-msg').textContent = '已保存 ✓ 热生效';
+      const st = await api.apiGet('stats');
+      const b = st.budget || {};
+      $('budget-stat').textContent = (b.limit > 0)
+        ? `今日已用 ${b.used} / ${b.limit} token（剩余 ${b.remaining}）`
+        : `今日已用 ${b.used || 0} token（未设上限）`;
+    } catch (e) { $('group-msg').textContent = '保存失败：' + e.message; }
+    $('save-group').disabled = false;
+  };
+
+  // ---------------- 人设 ----------------
+  const short = (s, n = 70) => {
+    const t = String(s || '').replace(/\s+/g, ' ').trim();
+    return t.length > n ? t.slice(0, n) + '…' : t;
+  };
+
+  const LAYERS = {
+    shallow: {
+      title: '编辑浅层人格',
+      hint: '当前状态、情绪、短期设定。这一层常驻在每轮对话里，适合写会变的内容。',
+      key: 'persona_shallow',
+      placeholder: '例如：今天有点困，说话短短的，但被问到喜欢的东西会突然来精神。'
+    },
+    deep: {
+      title: '编辑深层人格',
+      hint: '核心性格、说话风格、价值观、身份。适合写长期不变的人设。',
+      key: 'persona_deep',
+      placeholder: '例如：你是胡桃，往生堂第七十七代堂主，爱写打油诗，嘴贫但心软，从不把悲伤挂在脸上。'
+    },
+    legacy: {
+      title: '编辑旧版单卡',
+      hint: '浅层和深层都为空时，才会用这张单卡。新配置建议用上面两层。',
+      key: 'persona_text',
+      placeholder: '这里写一整段人设。'
+    }
+  };
+
+  let editorLayer = null;
+  let editorBase = '';
+  let editorDirty = false;
+
+  function layerValue(layer) {
+    return String(val(LAYERS[layer].key) || '');
+  }
+
+  function paintPreview(layer) {
+    const el = $('acc-' + layer).querySelector('.acc-preview');
+    const t = short(layerValue(layer));
+    el.textContent = t || '未填写';
+    el.classList.toggle('empty', !t);
+  }
+
+  function paintAll() {
+    Object.keys(LAYERS).forEach(paintPreview);
+  }
+
+  function countEditor() {
+    const n = $('editor-text').value.length;
+    $('editor-count').textContent = n ? n + ' 字' : '还没有内容';
+  }
+
+  function openEditor(layer) {
+    editorLayer = layer;
+    const cfg = LAYERS[layer];
+    $('editor-title').textContent = cfg.title;
+    $('editor-hint').textContent = cfg.hint;
+    const ta = $('editor-text');
+    ta.value = layerValue(layer);
+    ta.placeholder = cfg.placeholder;
+    editorBase = ta.value;
+    editorDirty = false;
+    $('editor-msg').textContent = '';
+    countEditor();
+    document.body.style.overflow = 'hidden';
+    $('persona-editor').classList.add('on');
+    ta.focus();
+  }
+
+  function closeEditor(force) {
+    if (!force && editorDirty &&
+        !confirm('这一层有未保存的修改，返回后会丢失，继续吗？')) return;
+    $('persona-editor').classList.remove('on');
+    document.body.style.overflow = '';
+    editorLayer = null;
+    editorDirty = false;
+  }
+
+  Object.keys(LAYERS).forEach(layer => {
+    $('acc-' + layer).querySelector('.acc-head').onclick = () => openEditor(layer);
+  });
+
+  $('editor-text').oninput = () => {
+    editorDirty = $('editor-text').value !== editorBase;
+    countEditor();
+    $('editor-msg').textContent = '';
+  };
+
+  $('editor-back').onclick = () => closeEditor(false);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && editorLayer) closeEditor(false);
+  });
+
+  $('editor-save').onclick = async () => {
+    if (!editorLayer) return;
+    const layer = editorLayer;
+    const btn = $('editor-save');
+    btn.disabled = true;
+    try {
+      await api.apiPost('config', { [LAYERS[layer].key]: $('editor-text').value });
+      state.cfg[LAYERS[layer].key] = $('editor-text').value;
+      editorBase = $('editor-text').value;
+      editorDirty = false;
+      paintPreview(layer);
+      $('editor-msg').textContent = '已保存 ✓ 热生效';
+    } catch (e) { $('editor-msg').textContent = '保存失败：' + e.message; }
+    btn.disabled = false;
+  };
+
+  async function loadPersona() {
+    try {
+      if (!Object.keys(state.cfg).length) {
+        state.cfg = await api.apiGet('config');
+      }
+      paintAll();
+      await loadPacks();
+    } catch (e) { $('editor-msg').textContent = '加载失败：' + e.message; }
+  }
+
+  async function loadPacks(prefer, openId) {
+    const r = await api.apiGet('packs');
+    state.packs = r.packs || [];
+    state.active = r.active || val('persona_pack') || '';
+    const sel = $('pack-select');
+    sel.innerHTML = '';
+    for (const p of state.packs) {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.name + '（' + p.chapters + ' 篇）'
+        + (p.name === state.active ? ' · 使用中' : '');
+      sel.appendChild(opt);
+    }
+    if (!state.packs.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '（还没有角色包）';
+      sel.appendChild(opt);
+    }
+    state.pack = prefer || state.active
+      || (state.packs[0] && state.packs[0].name) || '';
+    sel.value = state.pack || '';
+    $('pack-state').textContent = state.active
+      ? '当前启用：' + state.active
+      : '当前启用：无（背景故事不会进上下文）';
+    updatePackButtons();
+    await loadChapters(openId);
+  }
+
+  function updatePackButtons() {
+    const btn = $('pack-activate');
+    const active = !!state.pack && state.pack === state.active;
+    btn.disabled = !state.pack || active;
+    btn.textContent = active ? '已启用' : '启用这个包';
+  }
+
+  $('pack-select').onchange = async () => {
+    const next = $('pack-select').value;
+    if (next === state.pack) return;
+    if (hasDirtyChapter() &&
+        !confirm('当前篇章有未保存的修改，切换角色包会丢失，继续吗？')) {
+      $('pack-select').value = state.pack;
+      return;
+    }
+    state.pack = next;
+    updatePackButtons();
+    await loadChapters();
+  };
+
+  $('pack-activate').onclick = async () => {
+    if (!state.pack) return;
+    try {
+      await api.apiPost('config', { persona_pack: state.pack });
+      state.cfg.persona_pack = state.pack;
+      await loadPacks(state.pack);
+      $('pack-state').textContent = '已启用：' + state.pack;
+    } catch (e) { $('pack-state').textContent = '启用失败：' + e.message; }
+  };
+
+  $('pack-new-toggle').onclick = () => {
+    const row = $('pack-new-row');
+    const show = row.style.display === 'none';
+    row.style.display = show ? 'flex' : 'none';
+    if (show) $('pack-new').focus();
+  };
+
+  $('pack-new-cancel').onclick = () => {
+    $('pack-new-row').style.display = 'none';
+    $('pack-new').value = '';
+  };
+
+  $('pack-create').onclick = async () => {
+    const name = $('pack-new').value.trim();
+    if (!name) { $('pack-state').textContent = '角色包名不能为空'; return; }
+    try {
+      await api.apiPost('config', { persona_pack: name });
+      state.cfg.persona_pack = name;
+      $('pack-new').value = '';
+      $('pack-new-row').style.display = 'none';
+      await loadPacks(name);
+      $('pack-state').textContent = '已新建并启用角色包：' + name;
+    } catch (e) { $('pack-state').textContent = '新建失败：' + e.message; }
+  };
+
+  function hasDirtyChapter() {
+    return !!$('chapter-list').querySelector('.chapter.open[data-dirty="1"]');
+  }
+
+  function fieldRow(labelText, el) {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const lb = document.createElement('label');
+    lb.textContent = labelText;
+    wrap.append(lb, el);
+    return wrap;
+  }
+
+  function textInput(value, placeholder) {
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.value = value || '';
+    inp.placeholder = placeholder || '';
+    return inp;
+  }
+
+  function textArea(value, placeholder) {
+    const ta = document.createElement('textarea');
+    ta.className = 'big';
+    ta.value = value || '';
+    ta.placeholder = placeholder || '';
+    return ta;
+  }
+
+  function chapterRow(ch, open) {
+    const row = document.createElement('div');
+    row.className = 'chapter' + (open ? ' open' : '');
+    row.dataset.id = ch.id == null ? 'draft' : String(ch.id);
+
+    const head = document.createElement('div');
+    head.className = 'chapter-head';
+    const main = document.createElement('div');
+    main.className = 'chapter-main';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'chapter-title';
+    titleEl.textContent = ch.id == null ? '新增篇章（未保存）' : (ch.title || '未命名');
+    const subEl = document.createElement('div');
+    subEl.className = 'chapter-sub';
+    subEl.textContent = short(ch.summary, 90) || '还没有摘要';
+    main.append(titleEl, subEl);
+    const chev = document.createElement('span');
+    chev.className = 'chapter-chev';
+    head.append(main, chev);
+
+    const body = document.createElement('div');
+    body.className = 'chapter-body';
+    const inpTitle = textInput(ch.title, '标题，如 往生堂与胡桃');
+    const inpSummary = textInput(ch.summary, '一句话摘要，用于关键词召回');
+    const inpContent = textArea(ch.content, '正文，命中关键词后才会进入上下文……');
+
+    const actions = document.createElement('div');
+    actions.className = 'chapter-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'save';
+    saveBtn.textContent = '保存篇章';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'ghost danger';
+    delBtn.textContent = ch.id == null ? '取消新增' : '删除这篇';
+    const msg = document.createElement('span');
+    msg.className = 'msg';
+    actions.append(saveBtn, delBtn, msg);
+
+    body.append(
+      fieldRow('标题', inpTitle),
+      fieldRow('摘要（进索引，用于召回）', inpSummary),
+      fieldRow('正文（命中后进上下文）', inpContent),
+      actions);
+    row.append(head, body);
+
+    const markDirty = () => { row.dataset.dirty = '1'; };
+    inpTitle.oninput = () => {
+      markDirty();
+      titleEl.textContent = inpTitle.value.trim() || (ch.id == null ? '新增篇章（未保存）' : '未命名');
+    };
+    inpSummary.oninput = () => {
+      markDirty();
+      subEl.textContent = short(inpSummary.value, 90) || '还没有摘要';
+    };
+    inpContent.oninput = markDirty;
+
+    head.onclick = () => {
+      if (row.classList.contains('open')) {
+        if (row.dataset.dirty === '1' &&
+            !confirm('这篇有未保存的修改，收起后会丢失，继续吗？')) return;
+        row.classList.remove('open');
+        row.dataset.dirty = '';
+        return;
+      }
+      const other = $('chapter-list').querySelector('.chapter.open');
+      if (other) {
+        if (other.dataset.dirty === '1' &&
+            !confirm('另一篇有未保存的修改，切换会丢失，继续吗？')) return;
+        other.classList.remove('open');
+        other.dataset.dirty = '';
+      }
+      row.classList.add('open');
+      inpTitle.focus();
+    };
+
+    saveBtn.onclick = async (ev) => {
+      ev.stopPropagation();
+      const title = inpTitle.value.trim();
+      if (!title) { msg.textContent = '标题不能为空'; inpTitle.focus(); return; }
+      saveBtn.disabled = true;
+      msg.textContent = '保存中…';
+      try {
+        const r = await api.apiPost('chapter', {
+          pack: state.pack,
+          id: ch.id,
+          title,
+          summary: inpSummary.value.trim(),
+          content: inpContent.value
+        });
+        row.dataset.dirty = '';
+        const savedId = (r && (r.id != null ? r.id : (r.data && r.data.id))) || ch.id;
+        await loadPacks(state.pack, savedId);
+        $('ch-msg').textContent = '已保存 ✓ 标题常驻，正文按关键词召回';
+      } catch (e) {
+        msg.textContent = '保存失败：' + e.message;
+        saveBtn.disabled = false;
+      }
+    };
+
+    delBtn.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (ch.id == null) {
+        row.remove();
+        $('ch-msg').textContent = '';
+        return;
+      }
+      if (!confirm('删除这篇背景故事？')) return;
+      delBtn.disabled = true;
+      try {
+        await api.apiPost('chapter/delete', { pack: state.pack, id: ch.id });
+        await loadPacks(state.pack);
+        $('ch-msg').textContent = '已删除';
+      } catch (e) {
+        msg.textContent = '删除失败：' + e.message;
+        delBtn.disabled = false;
+      }
+    };
+
+    return row;
+  }
+
+  async function loadChapters(openId) {
+    const box = $('chapter-list');
+    $('ch-msg').textContent = '';
+    if (!state.pack) {
+      box.innerHTML = '<div class="hint">先选择或新建角色包。</div>';
+      $('chapter-count').textContent = '';
+      return;
+    }
+    box.innerHTML = '<div class="hint">加载中…</div>';
+    try {
+      const r = await api.apiGet('chapters', { pack: state.pack });
+      state.chapters = r.chapters || [];
+      box.innerHTML = '';
+      $('chapter-count').textContent = state.chapters.length
+        ? '共 ' + state.chapters.length + ' 篇' : '';
+      if (!state.chapters.length) {
+        box.innerHTML = '<div class="hint">这个包还没有篇章，点右上角「＋ 新增篇章」写第一篇。</div>';
+        return;
+      }
+      for (const c of state.chapters) {
+        box.appendChild(chapterRow(c, c.id === openId));
+      }
+    } catch (e) {
+      box.textContent = '加载失败：' + e.message;
+    }
+  }
+
+  $('ch-add').onclick = () => {
+    if (!state.pack) { $('ch-msg').textContent = '先选择或新建角色包'; return; }
+    const box = $('chapter-list');
+    let draft = box.querySelector('.chapter[data-id="draft"]');
+    if (!draft) {
+      const other = box.querySelector('.chapter.open');
+      if (other) {
+        if (other.dataset.dirty === '1' &&
+            !confirm('另一篇有未保存的修改，新增会丢失，继续吗？')) return;
+        other.classList.remove('open');
+        other.dataset.dirty = '';
+      }
+      draft = chapterRow({ id: null, title: '', summary: '', content: '' }, true);
+      box.prepend(draft);
+    }
+    draft.classList.add('open');
+    draft.querySelector('input').focus();
+  };
+
+  // ---------------- 启动 ----------------
+  await (api && api.ready ? api.ready() : Promise.resolve());
+  await loadGroup();
+  await loadBudget();
+  await loadUsers();
+  await loadPersona();
+})();
+</script>
+</body>
+</html>

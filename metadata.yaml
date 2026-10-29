@@ -1,0 +1,28 @@
+name: astrbot_plugin_qqmind
+display_name: 群聊记忆体
+short_desc: 四轴群聊记忆 + 私聊日记 + 三层人设——省钱、可寻回、可配置
+desc: |
+  群聊记忆体（qqmind）：为 AstrBot 装上一套可配置的记忆管线。
+
+  群聊：唤醒、读取、记忆、回复四条轴独立可调，打包成轻量/全量/分层/高级四档套餐。
+  浅层判读门只喂最近几条群消息，判否只拦主模型（不干扰其他插件与命令），零消耗；
+  判是才回复。需要动脑的请求（创作/推理）自动切思考模型，闲聊走轻快模型。
+  记忆支持平铺、浅层+群日记分层、按 QQ 号每人 4000 token 的精确记忆线；
+  群日记与私聊日记同机制——标题+时间+标签+摘要，纯 BM25+时间寻回，零 embedding。
+
+  私聊：窗口按 token 预算管理（默认 10000，可调），溢出自动压成日记；
+  日记对用户可见，「还记得吗」「我们昨天聊了什么」都能翻出来。
+
+  人设：浅层状态 + 深层性格常驻，背景故事按篇章库管理（标题常驻、正文关键词召回）。
+  护栏：每日 token 预算熔断、每群频率上限、@全体忽略、bot 互怼拦截。
+  判读/压缩/回复可分别指定模型（judge_model/think_model），单模型也能跑。
+version: 0.1.1
+author: DanDingBenShao
+repo: https://github.com/DanDingBenShao/astrbot_plugin_qqmind
+astrbot_version: ">=4.29.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - 记忆
+  - qq
+  - 省token

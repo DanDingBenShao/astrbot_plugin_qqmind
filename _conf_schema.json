@@ -1,0 +1,255 @@
+{
+  "judge_scope": {
+    "description": "判读范围（监控期外也判）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后群里所有人所有消息都会判读（烧判读调用，慎开）；关闭=只有@过机器人开启监控期的用户消息才判读"
+  },
+  "group_preset": {
+    "description": "群聊套餐档位",
+    "type": "string",
+    "default": "light",
+    "hint": "light=轻量(只@) / full=全量 / layered=分层 / advanced=高级(四轴自选)"
+  },
+  "wake_keywords": {
+    "description": "文本关键词唤醒（可多个）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "命中后开启监控期并过判读门（不保证必回）；轻量档不生效；@全体成员永远不唤醒"
+  },
+  "group_buffer_size": {
+    "description": "群消息全时缓冲条数（判读和精确记忆都从这里取）",
+    "type": "int",
+    "default": 60,
+    "hint": "纯内存，不花 API 钱；重启清零"
+  },
+  "group_flat_messages": {
+    "description": "全量模式平铺进上下文的群消息条数",
+    "type": "int",
+    "default": 60
+  },
+  "group_shallow_messages": {
+    "description": "分层模式浅层原文条数（超出部分压成群日记）",
+    "type": "int",
+    "default": 20
+  },
+  "group_context_messages": {
+    "description": "轻量模式回复时带的最近群消息条数",
+    "type": "int",
+    "default": 20
+  },
+  "memory_layering": {
+    "description": "高级档开关A：记忆分层（浅层原文 + 深层群日记）",
+    "type": "bool",
+    "default": true
+  },
+  "precise_memory": {
+    "description": "高级档开关B：精确记忆（按QQ号每人一条群内记忆线）",
+    "type": "bool",
+    "default": false
+  },
+  "precise_budget_tokens": {
+    "description": "精确记忆每人 token 预算（溢出压成群日记）",
+    "type": "int",
+    "default": 4000,
+    "hint": "不含回复时附带的最近 10 条群聊历史"
+  },
+  "group_memory_dir": {
+    "description": "群记忆目录（每群一个 JSON，相对 AstrBot 数据目录）",
+    "type": "string",
+    "default": "qqmind_group_memory"
+  },
+  "group_diaries_dir": {
+    "description": "群日记目录（每群一个 SQLite，相对 AstrBot 数据目录）",
+    "type": "string",
+    "default": "qqmind_group_diaries"
+  },
+  "read_mode": {
+    "description": "高级档读取方式",
+    "type": "string",
+    "default": "batch",
+    "hint": "at_only=只@ / full=全量 / batch=攒批 / random=随机；仅 advanced 档生效，其它档由套餐决定"
+  },
+  "random_min_seconds": {
+    "description": "随机读最短间隔（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "random_max_seconds": {
+    "description": "随机读最长间隔（秒）",
+    "type": "int",
+    "default": 300
+  },
+  "roam_enabled": {
+    "description": "常驻神游：随机读在监控期外也生效",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时，随机读只在有人 @/关键词唤醒后的监控期内工作"
+  },
+    "judge_model": {
+    "description": "判读用模型（留空=主模型；推荐填无思考模型，判读快且省）",
+    "type": "string",
+    "default": "",
+    "hint": "如 deepseek-chat。判读只要三选一，思考是浪费"
+  },
+  "think_model": {
+    "description": "思考模型（判读判「是|思考」的当轮主回复切到它，留空=按主模型名自动推导）",
+    "type": "string",
+    "default": "",
+    "hint": "如 deepseek-reasoner；主模型名以 -nothink 结尾时自动去掉后缀"
+  },
+"reply_judge_enabled": {
+    "description": "判读门：读到的消息先判是否在对机器人说",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉后读到的每条消息都会回（靠频率上限兜底），只建议高级档使用"
+  },
+  "reply_rate_per_min": {
+    "description": "每群每分钟回复上限",
+    "type": "int",
+    "default": 6,
+    "hint": "同时兼作 QQ 风控保护；@必回不受此限制"
+  },
+  "max_judged_per_min": {
+    "description": "每群每分钟判读上限（全量读时防刷屏烧 token）",
+    "type": "int",
+    "default": 30
+  },
+  "daily_token_budget": {
+    "description": "每日 token 预算（0=不限制；烧完自动降级为只@）",
+    "type": "int",
+    "default": 0,
+    "hint": "按自然日滚动，重启不丢当天用量"
+  },
+  "quota_message": {
+    "description": "额度耗尽时在群里的提示文案",
+    "type": "text",
+    "default": "今天的额度用完啦，明天再来找我吧～",
+    "hint": "留空=不提示；每群每天最多提示 quota_notices_per_day 次"
+  },
+  "quota_notices_per_day": {
+    "description": "额度提示每群每天最多几次",
+    "type": "int",
+    "default": 2
+  },
+  "judge_fail_threshold": {
+    "description": "判读连续失败几次自动降级轻量（等下一条@恢复）",
+    "type": "int",
+    "default": 3
+  },
+  "bot_qq_ids": {
+    "description": "其他机器人的QQ号（不响应它们，防 bot 互怼循环）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "若平台原始事件带 is_robot 标记会自动识别，这里用于补充"
+  },
+  "usage_dir": {
+    "description": "每日预算账本目录（相对 AstrBot 数据目录）",
+    "type": "string",
+    "default": "qqmind_usage"
+  },
+  "followup_rounds": {
+    "description": "监控期接话额度：判否扣 1 格，判是刷新，扣完闭嘴",
+    "type": "int",
+    "default": 3,
+    "hint": "1~10"
+  },
+  "debounce_seconds": {
+    "description": "批量合并：等多久没有新消息就回复（秒）",
+    "type": "float",
+    "default": 10.0,
+    "hint": "每来一条新消息重新计时；1~120"
+  },
+  "batch_max_messages": {
+    "description": "批量合并：最多合并多少条，达到就立刻回复",
+    "type": "int",
+    "default": 10,
+    "hint": "1~100"
+  },
+  "max_judged_per_round": {
+    "description": "单轮判读上限（防刷屏烧 token）",
+    "type": "int",
+    "default": 12
+  },
+  "history_rounds": {
+    "description": "群聊逐字窗口轮数（1 轮=用户+回复）",
+    "type": "int",
+    "default": 110
+  },
+  "max_msg_tokens": {
+    "description": "群聊单条消息入史门槛（超长照回复但不入窗口）",
+    "type": "int",
+    "default": 100
+  },
+  "private_budget_tokens": {
+    "description": "私聊窗口 token 预算（溢出自动压成日记）",
+    "type": "int",
+    "default": 10000,
+    "hint": "感情陪伴型调大，省钱型调小"
+  },
+  "diaries_dir": {
+    "description": "日记库目录（每用户一个 SQLite，相对 AstrBot 数据目录）",
+    "type": "string",
+    "default": "qqmind_diaries"
+  },
+  "history_dir": {
+    "description": "群聊历史目录（相对 AstrBot 数据目录）",
+    "type": "string",
+    "default": "qqmind_history"
+  },
+  "diary_headers_in_prompt": {
+    "description": "系统提示词里带的日记标题行条数（时间+标题，让模型知道自己记过哪些事）",
+    "type": "int",
+    "default": 10
+  },
+  "persona_shallow": {
+    "description": "人设·浅层（当前状态/情绪/短期设定，常驻）",
+    "type": "text",
+    "default": ""
+  },
+  "persona_deep": {
+    "description": "人设·深层（核心性格/说话风格/价值观，常驻）",
+    "type": "text",
+    "default": ""
+  },
+  "persona_text": {
+    "description": "旧版人设单卡（浅层/深层都为空时使用）",
+    "type": "text",
+    "default": "你是群里的AI助手，说话自然口语化，像QQ聊天一样少量多次。",
+    "hint": "建议改用 persona_shallow + persona_deep 两层"
+  },
+  "persona_pack": {
+    "description": "启用的背景故事角色包（如「胡桃」「派蒙」；留空=不用）",
+    "type": "string",
+    "default": ""
+  },
+  "persona_packs_dir": {
+    "description": "背景故事包目录（相对 AstrBot 数据目录，每包一个 SQLite）",
+    "type": "string",
+    "default": "qqmind_persona_packs"
+  },
+  "persona_headers_in_prompt": {
+    "description": "常驻提示词的背景故事篇目标题条数",
+    "type": "int",
+    "default": 20
+  },
+  "persona_recall_top": {
+    "description": "每条消息最多召回几篇背景正文",
+    "type": "int",
+    "default": 2
+  },
+  "allowed_groups": {
+    "description": "群白名单（空=不限）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  }
+}

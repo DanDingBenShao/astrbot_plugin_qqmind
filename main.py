@@ -42,7 +42,7 @@ from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 from .core import proactive
 
-PLUGIN_VERSION = "0.2.6"
+PLUGIN_VERSION = "0.2.7"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -50,6 +50,7 @@ JUDGE_PROMPT_LEN = est_tokens(JUDGE_PROMPT)   # 判读 system 提示词的 token
 
 _DIARY_CMD_RE = re.compile(r'<查日记"([^"]{1,60})">')
 _GROUP_DIARY_CMD_RE = re.compile(r'<查群日记"([^"]{1,60})">')
+_CROSS_DIARY_CMD_RE = re.compile(r'<查别群日记"(\d{5,12})[:：]([^"]{1,60})">')
 _EXPAND_CMD_RE = re.compile(r'<看日记"#?(\d{1,4})">')
 
 # 控制台可读写的配置键（与 _conf_schema.json 对齐）
@@ -70,6 +71,7 @@ _CONFIG_KEYS = (
     "group_reply_max_chars", "vision_enabled", "vision_budget", "vision_model",
     "proactive_friends", "proactive_start", "proactive_end",
     "proactive_gap_hours", "proactive_per_day", "proactive_no_reply_limit",
+    "share_memory_across_groups",
     "daily_token_budget", "quota_message", "quota_notices_per_day",
     "bill_est_reply_tokens",
 )
@@ -108,6 +110,7 @@ class QQMindPlugin(star.Star):
         self._proactive = proactive.ProactiveState(
             int(self._cfg("proactive_per_day", 1)))
         self._proactive_task: asyncio.Task | None = None
+        self._STATS_G: dict[int, dict] = {}   # 分群计数子账（内存态，与 _STATS 同口径）
         self._register_page_apis()
 
     # ---------- 配置与存储路径 ----------
@@ -179,12 +182,30 @@ class QQMindPlugin(star.Star):
     def _budget_exhausted(self) -> bool:
         return self._budget().exhausted()
 
-    def _count_usage(self, *texts, resp=None) -> int:
+    _STATS_KEYS = ("judged", "blocked", "replied", "judge_think",
+                   "dropped_rate", "dropped_budget")
+
+    def _stat(self, key: str, gid=None, n=1) -> None:
+        """计数：全局聚合 + 分群子账（_STATS_G），一次调用双记。"""
+        self._STATS[key] = self._STATS.get(key, 0) + n
+        if gid is not None:
+            g = self._STATS_G.setdefault(int(gid), {})
+            g[key] = g.get(key, 0) + n
+
+    def _stats_for(self, gid: int | None) -> dict:
+        """账单口径：gid=None 全网汇总；gid=群号该群子账（缺键补 0）。"""
+        if gid is None:
+            return {k: self._STATS.get(k, 0) for k in self._STATS_KEYS}
+        g = self._STATS_G.get(int(gid), {})
+        return {k: g.get(k, 0) for k in self._STATS_KEYS}
+
+    def _count_usage(self, *texts, resp=None, gid=None) -> int:
+        """记一笔 token（总账必记；gid=群号同时记分群子账，0=私聊/后台）。"""
         usage = getattr(resp, "usage", None)
         n = (int(usage.total) if usage is not None
              else sum(est_tokens(t) for t in texts))
         if n:
-            self._budget().add(n)
+            self._budget().add(n, gid=gid)
         return n
 
     def _maybe_quota_notice(self, gid: int, event: AstrMessageEvent) -> None:
@@ -290,11 +311,11 @@ class QQMindPlugin(star.Star):
             return
         if self._budget_exhausted():
             # 熔断点补全：关判读时这里原来拦不住，攒批会继续烧主回复
-            self._STATS["dropped_budget"] += len(batch)
+            self._stat("dropped_budget", gid, len(batch))
             return
         if self._cfg("reply_judge_enabled", True):
             if not self._allow_judge(gid):
-                self._STATS["dropped_rate"] += len(batch)
+                self._stat("dropped_rate", gid, len(batch))
                 logger.info(f"[qqmind] batch dropped (judge rate) in {gid}: "
                             f"{len(batch)} msgs")
                 return
@@ -303,7 +324,7 @@ class QQMindPlugin(star.Star):
             if not ok:
                 return
         if not self._allow_reply(gid):
-            self._STATS["dropped_rate"] += len(batch)
+            self._stat("dropped_rate", gid, len(batch))
             logger.info(f"[qqmind] batch dropped (reply rate) in {gid}: "
                         f"{len(batch)} msgs")
             return
@@ -424,7 +445,7 @@ class QQMindPlugin(star.Star):
             return
         if not reply:
             return
-        self._count_usage(prompt, reply, resp=out)
+        self._count_usage(prompt, reply, resp=out, gid=int(gid))
         reply = await self._recall_reply(reply, "group", uid, gid)
         if not reply:
             return
@@ -445,7 +466,7 @@ class QQMindPlugin(star.Star):
         self._note_group(gid, self._bot_names.get(gid) or "AI", reply)
         if delivered:
             # 一段都没发出去的不算成功回复（避免失败轮虚增面板 delivered 数）
-            self._STATS["replied"] += 1
+            self._stat("replied", gid)
 
     def _memory_mode(self) -> str:
         preset = normalize_preset(self._cfg("group_preset", "light"))
@@ -538,6 +559,15 @@ class QQMindPlugin(star.Star):
             if headers:
                 parts.append("你有本群的日记（时间 标题，想细看就输出 "
                              "<查群日记\"关键词或时间\">）：\n" + headers)
+            # 跨群共享记忆（v0.2.7，默认关）：其他群的日记标题也带进来，
+            # 模型用 <查别群日记"群号:关键词"> 寻回——群间隐私默认隔离
+            if self._cfg("share_memory_across_groups", False):
+                cross = self._cross_group_headers(gid)
+                if cross:
+                    parts.append(
+                        "你在其他群也有日记（想看就输出 "
+                        "<查别群日记\"群号:关键词或时间\">，群号必须带上）：\n"
+                        + cross)
         if mode == "precise":
             n_ctx = 10
         elif self._is_light():
@@ -549,6 +579,19 @@ class QQMindPlugin(star.Star):
             if ctx:
                 parts.append(f"【最近的群聊（供理解语境，不必逐条回应）】\n{ctx}")
         return "\n".join(parts)
+
+    def _cross_group_headers(self, gid: int, n_each: int = 5) -> str:
+        """其他白名单群的日记标题（每群最多 n_each 条，标群号前缀）。"""
+        allowed = [int(g) for g in (self._cfg("allowed_groups") or [])
+                   if str(g).isdigit() and int(g) != int(gid)]
+        if not allowed:
+            return ""
+        blocks = []
+        for other in allowed[:5]:
+            headers = self._group_mem(other).diary_headers(n_each)
+            if headers:
+                blocks.append(f"【群 {other}】\n{headers}")
+        return "\n".join(blocks)
 
     def _record_incoming(self, gid: int, uid: int, nick: str, text: str) -> None:
         """全量/分层模式把每条群消息记进平铺窗口（轻量不记，精确记忆只记互动）。"""
@@ -600,7 +643,7 @@ class QQMindPlugin(star.Star):
         if provider is not None:
             used = await gm.compress_messages(provider, msgs, tags_extra)
         if used:
-            self._budget().add(int(used))
+            self._budget().add(int(used), gid=int(gid))
             logger.info(f"[qqmind] group diary entry for {gid}, "
                         f"{len(msgs)} msgs")
             return
@@ -765,14 +808,14 @@ class QQMindPlugin(star.Star):
             return
         if not self._cfg("reply_judge_enabled", True):
             if not self._allow_reply(gid):
-                self._STATS["dropped_rate"] += 1
+                self._stat("dropped_rate", gid)
                 event.should_call_llm(True)
                 return
             event.is_at_or_wake_command = True
             event.is_wake = True
             return
         if not self._allow_judge(gid):
-            self._STATS["dropped_rate"] += 1
+            self._stat("dropped_rate", gid)
             event.should_call_llm(True)
             return
         bot_name = await self._bot_group_name(event, gid)
@@ -781,7 +824,7 @@ class QQMindPlugin(star.Star):
             event.should_call_llm(True)
             return
         if not self._allow_reply(gid):
-            self._STATS["dropped_rate"] += 1
+            self._stat("dropped_rate", gid)
             event.should_call_llm(True)
             return
         event.is_at_or_wake_command = True
@@ -829,7 +872,7 @@ class QQMindPlugin(star.Star):
                                f"degraded to light until next @")
             logger.warning(f"[qqmind] judge error (fail-closed): {e!r}")
             return False, False
-        self._count_usage(ask, out_text, resp=out)
+        self._count_usage(ask, out_text, resp=out, gid=int(gid))
         verdict = parse_judge_verdict(out_text)
         if verdict is None:
             # 模型输出不合规格：按失败计，走 fail-closed（宁漏接不插嘴）
@@ -848,16 +891,16 @@ class QQMindPlugin(star.Star):
         self._judge_fail[gid] = 0
         self._degraded.discard(gid)
         ok, think = verdict
-        self._STATS["judge_think"] += int(think)
+        self._stat("judge_think", gid, int(think))
         # 账单唯一计账点（v0.2.3）：读/拦只在判读出口记，三条调用路径
         # （全量/监控期/攒批）自动统一——攒批此前整条路径漏计，账单「读」严重偏小。
         # 读=k 条（整批判读看了 k 条）；拦=1 次回复决策（整批判否也只省一次回复）
         k = len(batch) if batch else 1
         self._STATS["judge_in"] += est_tokens(ask) + JUDGE_PROMPT_LEN
         self._STATS["judge_out"] += est_tokens(out_text)
-        self._STATS["judged"] += k
+        self._stat("judged", gid, k)
         if not ok:
-            self._STATS["blocked"] += 1
+            self._stat("blocked", gid)
             self._bill_saved(1)
         logger.info(f"[qqmind] judge -> {'是|思考' if think else ('是|直接' if ok else '否')}: {pending[:40]}")
         return ok, think
@@ -965,6 +1008,25 @@ class QQMindPlugin(star.Star):
         返回清洗后的最终文本（不再含任何回捞标记）。
         """
         cmd_re = _DIARY_CMD_RE if scope == "private" else _GROUP_DIARY_CMD_RE
+        provider = self.context.get_using_provider()
+        # 跨群寻回（v0.2.7）：<查别群日记"群号:关键词">——只有共享开关开着才响应
+        cross_m = (_CROSS_DIARY_CMD_RE.search(reply)
+                   if scope == "group"
+                   and self._cfg("share_memory_across_groups", False) else None)
+        if cross_m and provider is not None:
+            cross_gid, query = int(cross_m.group(1)), cross_m.group(2)
+            allowed = [int(g) for g in (self._cfg("allowed_groups") or [])]
+            if cross_gid not in allowed:
+                return _CROSS_DIARY_CMD_RE.sub("", reply).strip() or \
+                    "那个群没有开通我的记忆。"
+            found = self._group_mem(cross_gid).diary.search(query) or \
+                self._group_mem(cross_gid).diary.by_time(query)
+            system = self._group_system_prompt(gid)
+            contexts = self._group_contexts(gid, uid)
+            return await self._recall_answer(
+                reply, query, found, system, contexts, provider,
+                scope, uid, gid, cross_gid,
+                strip_re=_CROSS_DIARY_CMD_RE)
         m = cmd_re.search(reply)
         if not m:
             return reply
@@ -982,10 +1044,18 @@ class QQMindPlugin(star.Star):
                      else gm.diary.search(query))
             system = self._group_system_prompt(gid)
             contexts = self._group_contexts(gid, uid)
-        provider = self.context.get_using_provider()
         if provider is None:
             return reply.replace(m.group(0), "").strip() or \
                 "我翻了一下日记，但没找到合适的答案。"
+        return await self._recall_answer(
+            reply, query, found, system, contexts, provider,
+            scope, uid, gid, gid, strip_re=cmd_re)
+
+    async def _recall_answer(self, reply: str, query: str, found: str,
+                             system: str, contexts: list, provider,
+                             scope: str, uid: int, gid: int, diary_gid: int,
+                             strip_re) -> str:
+        """寻回后的重答（本群/跨群/私聊共用）：三层展开 + 记账 + 清洗标记。"""
         # 三层日记（v0.2.5）：结果行带 ▷ 的篇目存有原话全文；模型想看细节
         # 就回 <看日记"#id">（最多两轮，防套娃烧 token）
         if scope == "private":
@@ -1013,7 +1083,7 @@ class QQMindPlugin(star.Star):
                 if scope == "private":
                     detail = self._private(uid).diary.expand(eid)
                 else:
-                    detail = self._group_mem(gid).diary.expand(eid)
+                    detail = self._group_mem(diary_gid).diary.expand(eid)
                 out2 = await provider.text_chat(
                     prompt=(f"（你刚才想查记忆：{query}）\n"
                             f"查询结果（概要）：\n{found}\n"
@@ -1022,21 +1092,27 @@ class QQMindPlugin(star.Star):
                     session_id=None, system_prompt=system,
                     contexts=contexts, image_urls=[])
                 new_reply = (out2.completion_text or "").strip()
-                self._count_usage(found + detail, new_reply, resp=out2)
+                self._count_usage(found + detail, new_reply, resp=out2,
+                                  gid=int(gid) if scope == "group" else 0)
                 clean = _EXPAND_CMD_RE.sub("", new_reply)
                 clean = _DIARY_CMD_RE.sub("", clean)
-                clean = _GROUP_DIARY_CMD_RE.sub("", clean).strip()
+                clean = _GROUP_DIARY_CMD_RE.sub("", clean)
+                clean = strip_re.sub("", clean).strip()
                 logger.info(f"[qqmind] diary recall '{query}' expanded #{eid}")
                 return clean or new_reply
             if new_reply:
-                self._count_usage(found, new_reply, resp=out)
+                self._count_usage(found, new_reply, resp=out,
+                                  gid=int(gid) if scope == "group" else 0)
                 clean = _DIARY_CMD_RE.sub("", new_reply)
-                clean = _GROUP_DIARY_CMD_RE.sub("", clean).strip()
+                clean = _GROUP_DIARY_CMD_RE.sub("", clean)
+                clean = strip_re.sub("", clean).strip()
                 logger.info(f"[qqmind] diary recall '{query}' answered")
                 return clean or new_reply
         except Exception as e:
             logger.warning(f"[qqmind] diary recall failed: {e!r}")
-        stripped = reply.replace(m.group(0), "").strip()
+        stripped = reply.replace(strip_re.search(reply).group(0)
+                                 if strip_re.search(reply) else "",
+                                 "").strip()
         return stripped or "我翻了一下日记，但没找到合适的答案。"
 
     async def _resolve_recall(self, event: AstrMessageEvent, resp,
@@ -1084,11 +1160,15 @@ class QQMindPlugin(star.Star):
         reply = (getattr(resp, "completion_text", "") or "").strip()
         if not uid or not reply:
             return
-        self._count_usage(event.message_str or "", reply, resp=resp)
+        self._count_usage(event.message_str or "", reply, resp=resp,
+                          gid=(int(event.get_group_id() or 0)
+                               if not event.is_private_chat() else 0))
         reply = await self._resolve_recall(event, resp, reply)
         if not reply:
             return
-        self._STATS["replied"] += 1
+        self._stat("replied",
+                   int(event.get_group_id() or 0)
+                   if not event.is_private_chat() else None)
         text = (event.message_str or "").strip()
         if event.is_private_chat():
             p = self._private(uid)
@@ -1126,7 +1206,7 @@ class QQMindPlugin(star.Star):
             ok = await p.compress_oldest(provider)
             if not ok:
                 return
-            self._budget().add(int(ok))
+            self._budget().add(int(ok), gid=0)
         logger.info(f"[qqmind] private compressed for {p.uid}, "
                     f"window={p.window_tokens()}/{p.budget} tok")
 
@@ -1624,19 +1704,41 @@ class QQMindPlugin(star.Star):
         当群友问「今天读了多少」「回了几条」「用了多少 token」「省了多少」
         这类问题时先调用本工具，再用结果自然地回答。
         """
-        s = self._STATS
+        if event.is_private_chat():
+            gid = None
+            scope_line = "全网总量"
+        else:
+            gid = int(event.get_group_id() or 0)
+            scope_line = "本群"
+        s = self._stats_for(gid)
         b = self._budget().snapshot()
-        return (f"今日（{b['day']}）账单：读 {s['judged']} 条，"
-                f"回 {s['replied']} 条，共消耗 {b['used']} token。")
+        lines = (f"今日（{b['day']}）{scope_line}账单：读 {s['judged']} 条，"
+                 f"回 {s['replied']} 条。")
+        if gid is None:
+            lines += f"全网共消耗 {b['used']} token。"
+        else:
+            lines += (f"{scope_line}消耗 {b.get('per_group', {}).get(gid, 0)}"
+                      f" token（全网 {b['used']}）。")
+        return lines
 
     @filter.command("账单")
     async def cmd_bill(self, event: AstrMessageEvent):
-        """今日账单：三个数（读了/回了/总 token），群私都可看。"""
+        """今日账单：群里=本群数据+全网总量；私聊=全网。"""
         s = self._STATS
         b = self._budget().snapshot()
+        if event.is_private_chat():
+            yield event.plain_result(
+                f"🐋 今日账单（{b['day']}·全网）：读 {s['judged']} 条"
+                f" · 回 {s['replied']} 条 · 用了 {b['used']} token")
+            return
+        gid = int(event.get_group_id() or 0)
+        g = self._stats_for(gid)
+        g_tok = b.get("per_group", {}).get(gid, 0)
         yield event.plain_result(
-            f"🐋 今日账单（{b['day']}）：读 {s['judged']} 条 · 回 {s['replied']} 条"
-            f" · 用了 {b['used']} token")
+            f"🐋 本群今日账单（{b['day']}）：读 {g['judged']} 条"
+            f" · 回 {g['replied']} 条 · 消耗 {g_tok} token\n"
+            f"（全网：读 {s['judged']} · 回 {s['replied']}"
+            f" · 用了 {b['used']} token）")
 
     @filter.command("日记")
     async def cmd_diary(self, event: AstrMessageEvent):

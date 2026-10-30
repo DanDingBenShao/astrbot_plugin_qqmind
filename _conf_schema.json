@@ -201,6 +201,12 @@
     "type": "int",
     "default": 3
   },
+  "share_memory_across_groups": {
+    "description": "跨群共享记忆（默认关：群间记忆互相隔离）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 A 群的 AI 能看到 B 群（白名单内）的日记标题并按需寻回；注意群间隐私"
+  },
   "judge_fail_threshold": {
     "description": "判读连续失败几次自动降级轻量（等下一条@恢复）",
     "type": "int",

@@ -170,6 +170,25 @@
     <button class="save" id="save-budget">保存</button>
     <div class="msg" id="budget-msg"></div>
   </div>
+
+  <div style="margin-top:28px">
+    <h3>历史数据导入</h3>
+    <div class="hint">从 DSH / 桥接方案迁移：把历史聊天一键压成日记，并提炼用户画像。导入在后台进行，完成后该用户的回复自动带上画像与记忆。</div>
+    <label>导入给哪个用户（QQ 号）</label>
+    <input type="text" id="import-uid" placeholder="例如 2169642730">
+    <div style="margin-top:8px">
+      <label>方式一：选择 AstrBot 已有会话</label>
+      <select id="import-source" style="width:100%"><option value="">加载中…</option></select>
+      <button class="save" id="import-from-source" style="margin-top:6px">从选中会话导入</button>
+    </div>
+    <div style="margin-top:10px">
+      <label>方式二：粘贴/上传聊天 JSON（数组，[{role,content},…]）</label>
+      <textarea id="import-json" rows="4" style="width:100%" placeholder='[{"role":"user","content":"你好"},…]'></textarea>
+      <button class="save" id="import-from-json" style="margin-top:6px">从 JSON 导入</button>
+    </div>
+    <div class="msg" id="import-msg"></div>
+    <div class="hint" id="import-progress" style="white-space:pre-wrap"></div>
+  </div>
 </div>
 
 <!-- ================= 群聊 ================= -->
@@ -432,12 +451,18 @@
       for (const u of users) {
         const div = document.createElement('div');
         div.className = 'user';
+        const av = document.createElement('img');
+        av.src = u.avatar || '';
+        av.width = 28; av.height = 28;
+        av.style.cssText = 'border-radius:50%;vertical-align:middle;flex:none';
+        av.onerror = () => { av.style.display = 'none'; };
         const left = document.createElement('span');
         left.textContent = u.uid;
         const right = document.createElement('span');
         right.className = 'n';
         right.textContent = `${u.diaries} 篇日记 · 窗口 ${u.window_tokens} tok`;
-        div.append(left, right);
+        div.style.cssText += ';display:flex;align-items:center;gap:8px';
+        div.append(av, left, right);
         div.onclick = () => openDiary(u.uid);
         $('user-list').appendChild(div);
       }
@@ -498,6 +523,70 @@
     $('diary-index').style.display = 'block';
     loadUsers();
   };
+
+  // ---------------- 数据导入 ----------------
+  let importTimer = null;
+  async function loadImportSources() {
+    try {
+      const r = await api.apiGet('import/sources');
+      const sel = $('import-source');
+      sel.innerHTML = '<option value="">（选择会话）</option>';
+      for (const s of (r.sources || [])) {
+        const o = document.createElement('option');
+        o.value = s.id;
+        o.textContent = `${s.platform} · ${s.uid} · ${(s.size/1024).toFixed(0)}KB`;
+        sel.appendChild(o);
+      }
+    } catch (e) { $('import-source').innerHTML = `<option value="">加载失败：${e.message}</option>`; }
+  }
+  async function pollImport(id) {
+    try {
+      const r = await api.apiGet('import/status', { id });
+      const p = r;
+      $('import-progress').textContent =
+        `状态：${p.state} · 块 ${p.chunks_done}/${p.chunks_total} · ` +
+        `入日记 ${p.entries} 篇（失败 ${p.failed_chunks}）· ${p.elapsed}s`;
+      if (p.profile) {
+        const pf = p.profile;
+        $('import-progress').textContent +=
+          `\n画像：${pf.nickname || '（未识别称呼）'}` +
+          `\n特点：${(pf.traits||[]).join('、') || '—'}` +
+          `\n常聊：${(pf.interests||[]).join('、') || '—'}` +
+          `\n要记住：${(pf.facts||[]).join('、') || '—'}`;
+      }
+      if (p.state === 'done' || p.state === 'failed') {
+        clearInterval(importTimer); importTimer = null;
+        loadUsers();
+      }
+    } catch (e) { clearInterval(importTimer); importTimer = null;
+                  $('import-progress').textContent = '查询失败：' + e.message; }
+  }
+  async function startImport(payload) {
+    const uid = $('import-uid').value.trim();
+    if (!/^\d{5,12}$/.test(uid)) {
+      $('import-msg').textContent = '先填有效的 QQ 号'; return;
+    }
+    payload.uid = parseInt(uid, 10);
+    $('import-msg').textContent = '已提交，后台压缩中…';
+    try {
+      const r = await api.apiPost('import/start', payload);
+      $('import-msg').textContent = `已开始：${r.msgs} 条消息，分 ${r.chunks} 块`;
+      if (importTimer) clearInterval(importTimer);
+      importTimer = setInterval(() => pollImport(r.import_id), 2000);
+    } catch (e) { $('import-msg').textContent = '失败：' + e.message; }
+  }
+  $('import-from-source').onclick = () => {
+    const src = $('import-source').value;
+    if (!src) { $('import-msg').textContent = '先选一个会话'; return; }
+    startImport({ source: src });
+  };
+  $('import-from-json').onclick = () => {
+    let msgs;
+    try { msgs = JSON.parse($('import-json').value); }
+    catch (e) { $('import-msg').textContent = 'JSON 格式错误：' + e.message; return; }
+    startImport({ messages: msgs });
+  };
+  loadImportSources();
 
   // ---------------- 群聊 ----------------
   const PRESET_HINT = {

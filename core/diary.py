@@ -164,6 +164,36 @@ class DiaryStore:
         self._db.execute(
             "INSERT INTO meta(k, v) VALUES (?,?) "
             "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        self._db.commit()
+
+    # ---------- 用户画像（v0.2.6 数据导入配套） ----------
+    def save_profile(self, profile: dict) -> None:
+        """画像 JSON 存日记库 meta 表（与该用户日记同库同生命周期）。"""
+        self._meta_set("profile", json.dumps(profile, ensure_ascii=False))
+
+    def load_profile(self) -> dict:
+        try:
+            d = json.loads(self._meta_get("profile") or "{}")
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def profile_prompt(self) -> str:
+        """画像 → system prompt 片段（空画像返回空串）。"""
+        p = self.load_profile()
+        if not p:
+            return ""
+        lines = []
+        if p.get("nickname"):
+            lines.append(f"称呼：TA 常被叫「{p['nickname']}」")
+        for k, label in (("traits", "特点"), ("interests", "常聊"),
+                         ("facts", "要记住的事"), ("avoid", "忌讳")):
+            vals = [str(x) for x in (p.get(k) or []) if str(x).strip()]
+            if vals:
+                lines.append(f"{label}：{'；'.join(vals)}")
+        if not lines:
+            return ""
+        return "【关于这位用户的画像（来自历史记录）】\n" + "\n".join(lines)
 
     def _backfill_grams(self) -> None:
         """给 entries.grams 为空的行补二字组（迁移旧库；新写入在 add() 里带上）。"""

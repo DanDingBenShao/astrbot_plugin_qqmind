@@ -28,16 +28,21 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.web import request as _web_request
 
 from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
-                   DailyBudget, GroupBuffer, GroupMemory, MonitorSession,
-                   PrivateSession, RateLimiter, batch_should_flush,
+                   DailyBudget, GroupBuffer, GroupMemory, ImportJob,
+                   MonitorSession, PrivateSession, RateLimiter,
+                   batch_should_flush,
                    detect_wake, est_tokens, thinking_model,
                    keyword_wake_enabled, normalize_preset,
                    parse_judge_verdict, parse_time_query,
-                   preset_memory_mode, resolve_read_mode, split_bubbles)
+                   preset_memory_mode, resolve_read_mode, split_bubbles,
+                   VisionBudget, extract_image_urls)
+from .core.importer import normalize_messages, run_import
+from .core.vision import describe_image
 from .core.diagnostics import build_diagnostics
 from .core import diagnostics
+from .core import proactive
 
-PLUGIN_VERSION = "0.2.5"
+PLUGIN_VERSION = "0.2.6"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -62,7 +67,9 @@ _CONFIG_KEYS = (
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "history_rounds", "max_msg_tokens",
-    "group_reply_max_chars",
+    "group_reply_max_chars", "vision_enabled", "vision_budget", "vision_model",
+    "proactive_friends", "proactive_start", "proactive_end",
+    "proactive_gap_hours", "proactive_per_day", "proactive_no_reply_limit",
     "daily_token_budget", "quota_message", "quota_notices_per_day",
     "bill_est_reply_tokens",
 )
@@ -92,10 +99,15 @@ class QQMindPlugin(star.Star):
         self._judge_fail: dict[int, int] = {}
         self._degraded: set[int] = set()
         self._chapters: dict[str, ChapterStore] = {}
+        self._import_jobs: dict[str, ImportJob] = {}   # 导入任务表（控制台轮询进度）
         usage_dir = self._abs_dir("usage_dir", "qqmind_usage")
         self.budget = DailyBudget(os.path.join(usage_dir, "daily.json"), 0)
         self._hist_lock = asyncio.Lock()
         self._ring = diagnostics.attach(logger)
+        self._vision = VisionBudget(int(self._cfg("vision_budget", 50)))
+        self._proactive = proactive.ProactiveState(
+            int(self._cfg("proactive_per_day", 1)))
+        self._proactive_task: asyncio.Task | None = None
         self._register_page_apis()
 
     # ---------- 配置与存储路径 ----------
@@ -142,9 +154,19 @@ class QQMindPlugin(star.Star):
             p = PrivateSession(self._abs_dir("diaries_dir", "qqmind_diaries"), uid,
                                budget=budget)
             self.privates[uid] = p
+            self._ensure_proactive_loop()
         else:
             p.budget = budget      # 控制台改预算热生效
         return p
+
+    def _ensure_proactive_loop(self) -> None:
+        """守护循环懒启动（首个私聊会话建立时）；只在白名单非空时跑。"""
+        if self._proactive_task and not self._proactive_task.done():
+            return
+        if not (self._cfg("proactive_friends") or []):
+            return
+        self._proactive_task = asyncio.create_task(self._proactive_loop())
+        logger.info("[qqmind] proactive loop started")
 
     def _note_group(self, gid: int, nick: str, text: str):
         self.group_buffer.note(gid, nick, text)
@@ -343,6 +365,42 @@ class QQMindPlugin(star.Star):
         except Exception as e:
             logger.warning(f"[qqmind] onebot send failed: {e!r}")
             return False
+
+    # ---------- 图片/动图识别（v0.2.6） ----------
+    async def _vision_annotate(self, event: AstrMessageEvent,
+                               text: str) -> str:
+        """消息带图时把 [图片] 占位换成 [图片: 一句话描述]。
+
+        预算内才调视觉模型；失败/超限静默降级为原占位，不影响消息链。
+        描述同时进群缓冲与记忆（后续判读/回复都能看到图在表达什么）。
+        """
+        if not self._cfg("vision_enabled", True):
+            return text
+        segs = event.get_messages() or []
+        urls = extract_image_urls(segs)
+        if not urls:
+            return text
+        n_seen = int(self._STATS.get("vision_used", 0))
+        if not self._vision.allow():
+            self._STATS["vision_skipped"] = n_seen  # 保持结构存在
+            return text
+        provider = self.context.get_using_provider()
+        if provider is None:
+            return text
+        vm = str(self._cfg("vision_model", "") or "").strip()
+        descs = []
+        for u in urls[:1]:   # 每条消息只解 1 张（多图只解首张，省预算）
+            desc = await describe_image(provider, u, vm)
+            if desc:
+                descs.append(desc)
+        if not descs:
+            return text
+        self._vision.spend(len(descs))
+        self._STATS["vision_used"] = self._vision.used
+        note = "；".join(descs)
+        logger.info(f"[qqmind] vision: {note[:40]}")
+        base = text.strip()
+        return f"{base} [图片: {note}]".strip() if base else f"[图片: {note}]"
 
     async def _reply_group(self, gid: int, uid: int, prompt: str,
                            origin: str, batch=None) -> None:
@@ -559,6 +617,14 @@ class QQMindPlugin(star.Star):
         只拦主模型，不终结事件链——其他插件和命令照常处理。"""
         # 判读门只管群聊；私聊直接放行给挂点 2/3 处理
         if event.is_private_chat():
+            puid = int(event.get_sender_id() or 0)
+            if puid:
+                # 记住最近一次私聊 origin（主动私信的发送地址）；
+                # 用户回了话 → 主动私信未回应计数清零
+                self._runtime[("private", puid)] = {
+                    "origin": event.unified_msg_origin,
+                    "last_msg": time.time()}
+                self._proactive_reply_watch(puid)
             return
         gid = int(event.get_group_id() or 0)
         uid = int(event.get_sender_id() or 0)
@@ -579,6 +645,7 @@ class QQMindPlugin(star.Star):
         keywords = (self._cfg("wake_keywords", [])
                     if keyword_wake_enabled(preset) else [])
         wake = detect_wake(text, event.get_messages() or [], self_id, keywords)
+        text = await self._vision_annotate(event, text)
         self._note_group(gid, nick, text or "[图片]")
         rt = self._rt(gid)
         rt["origin"] = event.unified_msg_origin
@@ -878,6 +945,9 @@ class QQMindPlugin(star.Star):
         persona = self._persona_block()
         if persona:
             parts.append(persona)
+        profile_line = p.diary.profile_prompt()
+        if profile_line:
+            parts.append(profile_line)
         background = self._persona_background(query)
         if background:
             parts.append(background)
@@ -1060,8 +1130,85 @@ class QQMindPlugin(star.Star):
         logger.info(f"[qqmind] private compressed for {p.uid}, "
                     f"window={p.window_tokens()}/{p.budget} tok")
 
+    # ---------- 主动私信（v0.2.6） ----------
+    async def _proactive_loop(self) -> None:
+        """安静时段守候：每 10 分钟醒来一次，挑一个「现在闲」的白名单
+        用户发一条带记忆的问候。护栏全在 ProactiveState。"""
+        try:
+            while True:
+                await asyncio.sleep(600)
+                try:
+                    await self._proactive_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:     # noqa: BLE001 守护循环不许死
+                    logger.warning(f"[qqmind] proactive tick error: {e!r}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _proactive_tick(self) -> None:
+        friends = [str(x) for x in (self._cfg("proactive_friends") or [])]
+        if not friends:
+            return
+        if not in_quiet_hours(
+                start=str(self._cfg("proactive_start", "21:00")),
+                end=str(self._cfg("proactive_end", "22:30"))):
+            return
+        gap = float(self._cfg("proactive_gap_hours", 2.0))
+        # 候选 = 白名单 ∩ 有私聊窗口的用户，按最近活跃排序
+        actives = []
+        for f in friends:
+            uid = int(f) if f.isdigit() else 0
+            if uid and uid in self.privates and self.privates[uid].messages:
+                actives.append((uid, max(
+                    (m.get("ts") or 0) for m in self.privates[uid].messages)))
+        uid = pick_target(actives, gap)
+        if uid is None:
+            return
+        if not self._proactive.can_send(uid):
+            return
+        if self._budget_exhausted():
+            return
+        provider = self.context.get_using_provider()
+        if provider is None:
+            return
+        p = self.privates[uid]
+        digest = memory_digest(p.diary, p.messages)
+        bot_name = self._persona_block().split("\n")[0][:12] or "AI"
+        greeting = await build_greeting(provider, bot_name, str(uid), digest)
+        if not greeting:
+            return
+        origin = f"snowluma:FriendMessage:{uid}"
+        # 平台前缀按实际平台适配器生成——从已知私聊事件里取真实 origin 更稳
+        origin = self._latest_private_origin(uid) or origin
+        try:
+            from astrbot.api.event import MessageChain
+            await self.context.send_message(origin, MessageChain(
+                [{"type": "Plain", "text": greeting}]))
+        except Exception as e:
+            logger.warning(f"[qqmind] proactive send to {uid} failed: {e!r}")
+            return
+        self._proactive.mark_sent(uid)
+        p.messages.append({"role": "assistant", "content": greeting,
+                           "ts": time.time(), "proactive": True})
+        self._STATS["proactive_sent"] = self._STATS.get("proactive_sent", 0) + 1
+        logger.info(f"[qqmind] proactive greeting -> {uid}: {greeting[:40]}")
+
+    def _latest_private_origin(self, uid: int) -> str:
+        """该用户最近一条私聊事件的 unified_msg_origin（主动发送用它）。"""
+        rt = self._runtime.get(("private", uid)) or {}
+        return str(rt.get("origin") or "")
+
+    async def _proactive_reply_watch(self, uid: int) -> None:
+        """用户在主动消息后 24h 内回话 → 清零未回应计数（挂在私聊入口）。"""
+        if self._proactive.no_reply.get(uid):
+            self._proactive.mark_replied(uid)
+
     async def terminate(self) -> None:
         """插件卸载/重载：停掉随机读与攒批任务，关掉日记库句柄。"""
+        if self._proactive_task and not self._proactive_task.done():
+            self._proactive_task.cancel()
+            self._proactive_task = None
         for rt in self._runtime.values():
             for key in ("batch_task", "random_task"):
                 t = rt.get(key)
@@ -1084,7 +1231,8 @@ class QQMindPlugin(star.Star):
     # ---------- 配置页后端 API（views/console 通过面板桥调用） ----------
     _STATS = {"judged": 0, "blocked": 0, "replied": 0, "judge_think": 0,
               "dropped_rate": 0, "dropped_budget": 0,
-              "judge_in": 0, "judge_out": 0, "saved_in": 0}
+              "judge_in": 0, "judge_out": 0, "saved_in": 0,
+              "vision_used": 0, "vision_skipped": 0, "proactive_sent": 0}
 
     def _bill_saved(self, n_blocked: int) -> None:
         """拦截即省钱：被拦消息按「本来要一次完整回复」估算省下的输入量。
@@ -1149,6 +1297,104 @@ class QQMindPlugin(star.Star):
                 logger.warning(f"[qqmind] diagnostics failed: {e!r}")
                 return {"status": "error", "message": repr(e)}
 
+        # ---------- 数据一键导入（v0.2.6） ----------
+
+        async def api_import_sources():
+            """可导入来源：AstrBot conversations 表里的会话（按用户聚合）。"""
+            import sqlite3
+            db_path = os.path.join("data", "data_v4.db")
+            if not os.path.exists(db_path):
+                return {"status": "ok", "data": {"sources": []}}
+            try:
+                con = sqlite3.connect(db_path)
+                con.row_factory = sqlite3.Row
+                rows = con.execute(
+                    "SELECT platform_id, user_id, LENGTH(content) AS sz, "
+                    "updated_at FROM conversations ORDER BY updated_at DESC "
+                    "LIMIT 200").fetchall()
+                con.close()
+            except sqlite3.Error as e:
+                return {"status": "error", "message": repr(e)}
+            sources = []
+            for r in rows:
+                uid_part = str(r["user_id"] or "").split("!")[-1]
+                sources.append({
+                    "id": str(r["user_id"] or ""),   # user_id 已含平台前缀，全局唯一
+                    "platform": r["platform_id"],
+                    "uid": uid_part,
+                    "size": int(r["sz"] or 0),
+                    "updated": r["updated_at"]})
+            return {"status": "ok", "data": {"sources": sources}}
+
+        async def api_import_start():
+            """发起导入：source=AstrBot 会话 或 json=上传的历史数组。"""
+            payload = await _web_request.json(default={}) or {}
+            source = str(payload.get("source") or "").strip()
+            uid = int(payload.get("uid") or 0)
+            if uid <= 0:
+                return {"status": "error", "message": "缺少 uid（导入到谁）"}
+            if source:
+                import sqlite3
+                db_path = os.path.join("data", "data_v4.db")
+                if not os.path.exists(db_path):
+                    return {"status": "error", "message": "找不到 data_v4.db"}
+                con = sqlite3.connect(db_path)
+                row = con.execute(
+                    "SELECT content FROM conversations WHERE user_id = ?",
+                    (source,)).fetchone()
+                con.close()
+                if not row:
+                    return {"status": "error", "message": f"会话不存在：{source}"}
+                raw = row[0]
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except json.JSONDecodeError:
+                        return {"status": "error",
+                                "message": "会话内容不是合法 JSON"}
+            else:
+                raw = payload.get("messages")
+                if raw is None:
+                    return {"status": "error",
+                            "message": "缺少 source 或 messages"}
+            msgs = normalize_messages(raw)
+            if not msgs:
+                return {"status": "error",
+                        "message": "没有可识别的对话内容（role/content）"}
+            from .core.importer import chunk_messages
+            job = ImportJob(uid, msgs, len(chunk_messages(msgs)))
+            import_id = f"imp_{int(time.time())}_{len(self._import_jobs)}"
+            self._import_jobs[import_id] = job
+            diary = self._private(uid).diary
+
+            async def _run_and_persist():
+                await run_import(job, diary,
+                                 self.context.get_using_provider())
+                if job.profile:
+                    try:
+                        diary.save_profile(job.profile)
+                        logger.info(f"[qqmind] import {import_id} "
+                                    f"profile saved for uid={uid}")
+                    except Exception as e:     # noqa: BLE001
+                        logger.warning(f"[qqmind] profile save failed: {e!r}")
+
+            asyncio.create_task(_run_and_persist())
+            logger.info(f"[qqmind] import {import_id} started: uid={uid} "
+                        f"msgs={len(msgs)} chunks={job.total_chunks}")
+            return {"status": "ok", "data": {"import_id": import_id,
+                                             "msgs": len(msgs),
+                                             "chunks": job.total_chunks}}
+
+        async def api_import_status():
+            qid = str(_web_request.query.get("id") or "").strip()
+            if qid:
+                job = self._import_jobs.get(qid)
+                if not job:
+                    return {"status": "error", "message": "任务不存在"}
+                return {"status": "ok", "data": job.progress()}
+            return {"status": "ok", "data": {k: j.progress() for k, j in
+                                             list(self._import_jobs.items())[-10:]}}
+
         async def api_diaries():
             import time as _t
             uid = str(_web_request.query.get("uid") or "").strip()
@@ -1186,8 +1432,11 @@ class QQMindPlugin(star.Star):
                 p = self.privates.get(u)
                 n = p.diary.count() if p else \
                     self._private(u).diary.count()
-                users.append({"uid": str(u), "diaries": n,
-                              "window_tokens": p.window_tokens() if p else 0})
+                users.append({
+                    "uid": str(u), "diaries": n,
+                    "window_tokens": p.window_tokens() if p else 0,
+                    # QQ 头像直链（qlogo 公共 CDN，无需 API/无需下载中转）
+                    "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={u}&s=100"})
             users.sort(key=lambda x: -x["diaries"])
             return {"status": "ok", "data": {"users": users}}
 
@@ -1271,6 +1520,15 @@ class QQMindPlugin(star.Star):
         self.context.register_web_api(
             f"/{PLUGIN_NAME}/diagnostics", api_diagnostics, ["GET"],
             "qqmind 一键诊断包")
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/import/sources", api_import_sources, ["GET"],
+            "qqmind 可导入来源")
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/import/start", api_import_start, ["POST"],
+            "qqmind 发起导入")
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/import/status", api_import_status, ["GET"],
+            "qqmind 导入进度")
 
     def _diagnostics_snapshot(self) -> dict:
         """组装诊断包（WebUI 与命令共用）。隐私：日记正文不出包。"""

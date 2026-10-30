@@ -12,3 +12,9 @@ from .group import (DEFAULT_PRESET, PRESETS, READ_MODES, RateLimiter, WakeHit,
                     resolve_read_mode)
 from .private import PrivateSession
 from .group_memory import GroupMemory
+from .importer import (ImportJob, PROFILE_PROMPT, chunk_messages,
+                       extract_profile, normalize_messages, run_import)
+from .vision import (VisionBudget, VISION_PROMPT, describe_image,
+                     extract_image_urls, image_bytes_for_vision)
+from .proactive import (ProactiveState, build_greeting, in_quiet_hours,
+                        memory_digest, pick_target)

@@ -147,6 +147,60 @@
     "default": 80,
     "hint": "群聊防刷屏；私聊/日记回捞不受限。80 约等于两三句话"
   },
+  "vision_enabled": {
+    "description": "图片识别（表情包/截图看懂后进记忆）",
+    "type": "bool",
+    "default": true,
+    "hint": "需要主模型或 vision_model 支持视觉；不支持时自动降级为 [图片]"
+  },
+  "vision_budget": {
+    "description": "每天最多识别几张图",
+    "type": "int",
+    "default": 50,
+    "hint": "每张一次视觉模型调用，是真金白银的 token；0=完全关闭识别"
+  },
+  "vision_model": {
+    "description": "视觉模型（留空=用当前主模型）",
+    "type": "string",
+    "default": "",
+    "hint": "主模型不带视觉时填多模态模型名，如 glm-4v-flash / deepseek-vl2"
+  },
+  "proactive_friends": {
+    "description": "主动私信白名单（QQ号列表，空=功能关闭）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "只对名单里的好友主动发消息；每人每天最多 proactive_per_day 条"
+  },
+  "proactive_start": {
+    "description": "主动私信时段开始（如 21:00）",
+    "type": "string",
+    "default": "21:00"
+  },
+  "proactive_end": {
+    "description": "主动私信时段结束（如 22:30，支持跨午夜）",
+    "type": "string",
+    "default": "22:30"
+  },
+  "proactive_gap_hours": {
+    "description": "对方几小时没说话才视为「现在闲」",
+    "type": "int",
+    "default": 2,
+    "hint": "QQ 拿不到实时在线状态，用最近发言时间启发式判断"
+  },
+  "proactive_per_day": {
+    "description": "每人每天最多主动几条",
+    "type": "int",
+    "default": 1,
+    "hint": "风控敏感：建议 ≤2"
+  },
+  "proactive_no_reply_limit": {
+    "description": "连续几次没回应后冷却该用户 7 天",
+    "type": "int",
+    "default": 3
+  },
   "judge_fail_threshold": {
     "description": "判读连续失败几次自动降级轻量（等下一条@恢复）",
     "type": "int",

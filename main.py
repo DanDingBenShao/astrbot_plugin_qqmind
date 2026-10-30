@@ -43,7 +43,7 @@ from .core import diagnostics
 from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 
-PLUGIN_VERSION = "0.2.8"
+PLUGIN_VERSION = "0.2.9"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -1450,12 +1450,77 @@ class QQMindPlugin(star.Star):
             return {"status": "ok", "data": {"sources": sources}}
 
         async def api_import_start():
-            """发起导入：source=AstrBot 会话 或 json=上传的历史数组。"""
+            """发起导入。四种来源（v0.2.9 全兼容，自动识别）：
+            - source: AstrBot conversations 的 user_id（桥接用户）
+            - messages: 通用 [{role, content}, ...]
+            - export: DeepSeek/ChatGPT 官方导出的 conversations.json 内容
+              （多会话批量，每会话一个任务）
+            - zip_b64: 官方导出 zip 的 base64（自动找里面的 conversations.json）
+            """
             payload = await _web_request.json(default={}) or {}
             source = str(payload.get("source") or "").strip()
             uid = int(payload.get("uid") or 0)
             if uid <= 0:
                 return {"status": "error", "message": "缺少 uid（导入到谁）"}
+            from .core.importer import (chunk_messages, extract_conversations_json,
+                                        split_export_conversations)
+
+            def _launch(msgs: list[dict], label: str) -> str:
+                job = ImportJob(uid, msgs, len(chunk_messages(msgs)))
+                import_id = f"imp_{int(time.time())}_{len(self._import_jobs)}"
+                self._import_jobs[import_id] = job
+                diary = self._private(uid).diary
+
+                async def _run_and_persist():
+                    await run_import(job, diary,
+                                     self.context.get_using_provider())
+                    if job.profile:
+                        try:
+                            diary.save_profile(job.profile)
+                            logger.info(f"[qqmind] import {import_id} "
+                                        f"profile saved for uid={uid}")
+                        except Exception as e:     # noqa: BLE001
+                            logger.warning(f"[qqmind] profile save failed: {e!r}")
+
+                asyncio.create_task(_run_and_persist())
+                logger.info(f"[qqmind] import {import_id} started: uid={uid} "
+                            f"src={label} msgs={len(msgs)} "
+                            f"chunks={job.total_chunks}")
+                return import_id
+
+            zip_b64 = str(payload.get("zip_b64") or "").strip()
+            if zip_b64:
+                import base64
+                try:
+                    zbytes = base64.b64decode(zip_b64)
+                except Exception:
+                    return {"status": "error", "message": "zip base64 无效"}
+                raw = extract_conversations_json(zbytes)
+                if raw is None:
+                    return {"status": "error",
+                            "message": "zip 里没找到可解析的 conversations.json"}
+                convs = split_export_conversations(raw)
+                if not convs:
+                    return {"status": "error", "message": "包里没有可识别的对话"}
+                ids = {}
+                for i, c in enumerate(convs):
+                    ids[c.get("title") or f"会话{i + 1}"] = _launch(
+                        c["messages"], f"zip#{i + 1}")
+                return {"status": "ok",
+                        "data": {"conversations": len(convs),
+                                 "import_ids": ids}}
+            export = payload.get("export")
+            if export is not None:
+                convs = split_export_conversations(export)
+                if not convs:
+                    return {"status": "error", "message": "没有可识别的对话内容"}
+                ids = {}
+                for i, c in enumerate(convs):
+                    ids[c.get("title") or f"会话{i + 1}"] = _launch(
+                        c["messages"], f"export#{i + 1}")
+                return {"status": "ok",
+                        "data": {"conversations": len(convs),
+                                 "import_ids": ids}}
             if source:
                 import sqlite3
                 db_path = os.path.join("data", "data_v4.db")
@@ -1484,29 +1549,10 @@ class QQMindPlugin(star.Star):
             if not msgs:
                 return {"status": "error",
                         "message": "没有可识别的对话内容（role/content）"}
-            from .core.importer import chunk_messages
-            job = ImportJob(uid, msgs, len(chunk_messages(msgs)))
-            import_id = f"imp_{int(time.time())}_{len(self._import_jobs)}"
-            self._import_jobs[import_id] = job
-            diary = self._private(uid).diary
-
-            async def _run_and_persist():
-                await run_import(job, diary,
-                                 self.context.get_using_provider())
-                if job.profile:
-                    try:
-                        diary.save_profile(job.profile)
-                        logger.info(f"[qqmind] import {import_id} "
-                                    f"profile saved for uid={uid}")
-                    except Exception as e:     # noqa: BLE001
-                        logger.warning(f"[qqmind] profile save failed: {e!r}")
-
-            asyncio.create_task(_run_and_persist())
-            logger.info(f"[qqmind] import {import_id} started: uid={uid} "
-                        f"msgs={len(msgs)} chunks={job.total_chunks}")
+            import_id = _launch(msgs, "inline")
             return {"status": "ok", "data": {"import_id": import_id,
                                              "msgs": len(msgs),
-                                             "chunks": job.total_chunks}}
+                                             "chunks": len(chunk_messages(msgs))}}
 
         async def api_import_status():
             qid = str(_web_request.query.get("id") or "").strip()

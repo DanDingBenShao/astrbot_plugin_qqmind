@@ -39,32 +39,112 @@ PROFILE_PROMPT = (
 )
 
 
+def _flatten_mapping(mapping: object) -> list[dict]:
+    """官方导出的 mapping 树（节点 id → {message, parent, children}）
+    → 按对话顺序的消息列表（沿 children 链走，拿不到链就按 create_time 排）。"""
+    if not isinstance(mapping, dict):
+        return []
+    msgs = []
+    for node in mapping.values():
+        if not isinstance(node, dict):
+            continue
+        m = node.get("message")
+        if isinstance(m, dict):
+            msgs.append(m)
+    msgs.sort(key=lambda m: (float(m.get("create_time") or 0)))
+    return [{"role": (m.get("author") or {}).get("role"),
+             "content": m.get("content"),
+             "create_time": m.get("create_time")} for m in msgs]
+
+
+def split_export_conversations(raw: object) -> list[dict]:
+    """官方导出包（zip 解出的 conversations.json）→ 会话列表。
+
+    返回 [{"title": ..., "messages": [{role, content, ts?}]}]，
+    每个 messages 已过 normalize_messages（空会话丢弃）。
+    其他形态（单会话 dict/直接数组）返回 [单条]。
+    """
+    convs: object = None
+    if isinstance(raw, dict):
+        convs = (raw.get("conversations")
+                 or (1 if "mapping" in raw or "messages" in raw else None)
+                 or ([raw] if raw else None))
+    elif isinstance(raw, list):
+        convs = raw
+    if not convs or convs == 1:
+        convs = [raw] if raw else []
+    out = []
+    for c in convs:
+        if not isinstance(c, dict):
+            continue
+        msgs = normalize_messages(c)
+        if not msgs:
+            continue
+        out.append({"title": str(c.get("title") or "")[:40],
+                    "messages": msgs})
+    return out
+
+
+def extract_conversations_json(zip_bytes: bytes) -> dict | None:
+    """zip 包里找 conversations.json 并解析。找不到/解不开返回 None。"""
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for name in z.namelist():
+                base = name.rsplit("/", 1)[-1].lower()
+                if base.endswith(".json"):
+                    data = z.read(name)
+                    try:
+                        return json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+    except Exception:
+        return None
+    return None
+
+
 def normalize_messages(raw: object) -> list[dict]:
     """把各来源的历史记录统一成 [{role, content, ts?}]。
 
     支持：
     - conversations.content 风格：role/content，content 可能是 str 或
       [{type:"text", text:"..."}] 段数组
-    - DSH 导出风格：{"messages": [...]} 或直接数组
+    - DSH/DeepSeek 官方导出风格（ChatGPT 同构）：会话含 mapping 树
+      （每节点 {message: {author:{role}, content:{parts:[...]}, create_time}}），
+      由 split_export_conversations 先展开
+    - {"messages": [...]} / {"conversation": [...]} / 直接数组
     - 无法识别的行丢弃（导入宁缺毋滥）
     """
     if isinstance(raw, dict):
-        raw = raw.get("messages") or raw.get("conversation") or raw.get("data")
+        if "mapping" in raw:   # 官方导出的单个会话树 → 先展开
+            raw = _flatten_mapping(raw["mapping"])
+        else:
+            raw = raw.get("messages") or raw.get("conversation") \
+                or raw.get("data")
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
     for m in raw:
         if not isinstance(m, dict):
             continue
-        role = str(m.get("role") or m.get("from") or "").strip()
+        # 官方导出风格：消息本体在 m["message"] 里
+        inner = m.get("message") if isinstance(m.get("message"), dict) else m
+        author = inner.get("author") or {}
+        role = str(inner.get("role") or author.get("role")
+                   or m.get("from") or "").strip()
         if role in ("human", "user"):
             role = "user"
-        elif role in ("assistant", "bot", "gpt", "ai"):
+        elif role in ("assistant", "bot", "gpt", "ai", "model"):
             role = "assistant"
         else:
             continue
-        c = m.get("content")
-        if isinstance(c, list):
+        c = inner.get("content")
+        if isinstance(c, dict):   # 官方导出：content = {parts: [...], content_type}
+            parts = c.get("parts") or []
+            texts = [str(p) for p in parts if isinstance(p, str)]
+            content = "\n".join(t for t in texts if t)
+        elif isinstance(c, list):
             texts = [seg.get("text", "") for seg in c
                      if isinstance(seg, dict) and seg.get("type") == "text"
                      and not str(seg.get("text", "")).startswith("<system_reminder")]
@@ -75,7 +155,9 @@ def normalize_messages(raw: object) -> list[dict]:
         if not content or content.startswith("<system_reminder"):
             continue
         try:
-            ts = float(m.get("ts") or m.get("timestamp") or 0) or None
+            ts = float(m.get("ts") or m.get("timestamp")
+                       or inner.get("create_time") or m.get("create_time")
+                       or 0) or None
         except (TypeError, ValueError):
             ts = None
         if ts and ts > 1e12:   # 毫秒时间戳归一

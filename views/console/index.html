@@ -182,7 +182,14 @@
       <button class="save" id="import-from-source" style="margin-top:6px">从选中会话导入</button>
     </div>
     <div style="margin-top:10px">
-      <label>方式二：粘贴/上传聊天 JSON（数组，[{role,content},…]）</label>
+      <label>方式二：直接传文件（自动识别格式）</label>
+      <div class="hint">DeepSeek/ChatGPT 官方导出的 <b>zip 包</b>或解压出的 <b>conversations.json</b>，或其他聊天工具导出的 JSON 数组——选文件就行，多会话会全部导入。</div>
+      <input type="file" id="import-file" accept=".zip,.json"
+             style="margin-top:4px;width:100%">
+      <button class="save" id="import-from-file" style="margin-top:6px">从文件导入</button>
+    </div>
+    <div style="margin-top:10px">
+      <label>方式三：粘贴 JSON（数组，[{role,content},…]）</label>
       <textarea id="import-json" rows="4" style="width:100%" placeholder='[{"role":"user","content":"你好"},…]'></textarea>
       <button class="save" id="import-from-json" style="margin-top:6px">从 JSON 导入</button>
     </div>
@@ -615,6 +622,53 @@
     const src = $('import-source').value;
     if (!src) { $('import-msg').textContent = '先选一个会话'; return; }
     startImport({ source: src });
+  };
+  $('import-from-file').onclick = () => {
+    const f = $('import-file').files[0];
+    if (!f) { $('import-msg').textContent = '先选一个文件'; return; }
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        let payload;
+        if (f.name.toLowerCase().endsWith('.zip')) {
+          payload = { zip_b64: reader.result.split(',')[1] };
+        } else {
+          payload = { export: JSON.parse(reader.result) };
+        }
+        const uid = $('import-uid').value.trim();
+        if (!/^[0-9]{5,12}$/.test(uid)) { $('import-msg').textContent = '先填有效的 QQ 号'; return; }
+        payload.uid = parseInt(uid, 10);
+        $('import-msg').textContent = '已提交，后台压缩中…';
+        const r = await api.apiPost('import/start', payload);
+        if (r.import_ids) {
+          $('import-msg').textContent = `识别到 ${r.conversations} 个会话，全部开始导入`;
+          const ids = Object.values(r.import_ids);
+          if (importTimer) clearInterval(importTimer);
+          importTimer = setInterval(async () => {
+            try {
+              const all = await api.apiGet('import/status');
+              const jobs = ids.map(id => all[id]).filter(Boolean);
+              const done = jobs.filter(j => j.state === 'done').length;
+              const failed = jobs.filter(j => j.state === 'failed').length;
+              const entries = jobs.reduce((s, j) => s + (j.entries || 0), 0);
+              $('import-progress').textContent =
+                `会话 ${done}/${jobs.length} 完成（失败 ${failed}）· 已入日记 ${entries} 篇`;
+              if (done + failed >= jobs.length) {
+                clearInterval(importTimer); importTimer = null;
+                $('import-progress').textContent += ' · 全部结束';
+                loadUsers();
+              }
+            } catch (e) { clearInterval(importTimer); importTimer = null; }
+          }, 2500);
+        } else {
+          $('import-msg').textContent = `已开始：${r.msgs} 条消息，分 ${r.chunks} 块`;
+          if (importTimer) clearInterval(importTimer);
+          importTimer = setInterval(() => pollImport(r.import_id), 2000);
+        }
+      } catch (e) { $('import-msg').textContent = '失败：' + e.message; }
+    };
+    if (f.name.toLowerCase().endsWith('.zip')) reader.readAsDataURL(f);
+    else reader.readAsText(f);
   };
   $('import-from-json').onclick = () => {
     let msgs;

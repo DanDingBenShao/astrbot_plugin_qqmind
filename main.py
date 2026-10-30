@@ -42,8 +42,9 @@ from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
+from .core.private import complete_text
 
-PLUGIN_VERSION = "0.2.11"
+PLUGIN_VERSION = "0.2.12"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -95,6 +96,32 @@ def _quote_reply_prefix(segments) -> str:
             return f"[引用 {who or '有人'}：「{body}」] "
     return ""
 
+
+def _is_poke_self(segments, self_id: str) -> bool:
+    """这条事件是不是「有人戳了机器人」。
+
+    戳一戳以 Poke 组件到达（message_str 恒空）。目标字段随协议端版本
+    漂移（id / target_id / qq），全部鸭子探测；target 取不到（空/0）时
+    视为戳自己——notice 事件由会话路由，默认收件人就是被戳者。
+    """
+    for seg in segments or []:
+        if type(seg).__name__ != "Poke":
+            continue
+
+        def _field(name: str) -> str:
+            v = getattr(seg, name, "")
+            # Poke.target_id 是方法（respond.stage 用 comp.target_id() 判断），
+            # 不是字段——别把绑定方法/None 当目标值
+            if callable(v):
+                v = v()
+            return str(v) if v not in ("", None, 0) else ""
+
+        target = (_field("id") or _field("target_id")
+                  or _field("qq")).strip()
+        if not self_id or target in ("", "0") or target == str(self_id):
+            return True
+    return False
+
 # 控制台可读写的配置键（与 _conf_schema.json 对齐）
 _CONFIG_KEYS = (
     "persona_text", "persona_shallow", "persona_deep", "persona_pack",
@@ -143,6 +170,7 @@ class QQMindPlugin(star.Star):
         self.judge_limiter = RateLimiter(int(self._cfg("max_judged_per_min", 30)))
         self._runtime: dict[int, dict] = {}
         self._bot_names: dict[int, str] = {}
+        self._poke_last: dict[tuple[int, int], float] = {}   # (gid,uid)->上次反应
         self._judge_fail: dict[int, int] = {}
         self._degraded: set[int] = set()
         self._chapters: dict[str, ChapterStore] = {}
@@ -721,6 +749,110 @@ class QQMindPlugin(star.Star):
             gm.flat[:0] = msgs
         gm.save()
 
+    # ---------- 戳一戳（v0.2.12 完整版） ----------
+
+    _POKE_REACT_PROMPT = (
+        "有人戳了戳你（QQ 戳一戳）。用一句话当场反应，10~25 字，"
+        "不要输出任何别的。性格按你的人设来，反应要接得住对方的好感度档位：\n"
+        "{stance}\n"
+        "禁止解释自己是程序/机器人。")
+
+    _POKE_STANCES = (
+        ("陌生", "对方是陌生人：礼貌带点距离，客气地问对方有什么事"),
+        ("熟识", "对方是熟人：自然随意，可以玩笑或吐槽对方的突袭"),
+        ("亲近", "对方是你喜欢的人：开心、害羞或撒娇，按人设来"),
+        ("生气", "对方惹过你/你正嫌弃 TA：炸毛、嫌弃，但别辱骂"),
+    )
+
+    async def _on_poked(self, gid: int, uid: int, event) -> None:
+        """被戳反应：必回 + 好感度分档 + 概率回戳 + 进日记。
+
+        独立于判读门（戳人不需要判是不是在叫它），但受每群频率上限约束；
+        高频连戳只回第一下，冷却内静默（不刷屏）。
+        """
+        now = time.time()
+        # 每人冷却 60s：连戳只认真反应一次，其余记数不回
+        last = self._poke_last.get((gid, uid), 0.0)
+        self._poke_last[(gid, uid)] = now
+        if now - last < 60.0:
+            return
+        if not self._allow_reply(gid):
+            return
+        if self._budget_exhausted():
+            return
+        nick = (event.get_sender_name() or "").strip() or str(uid)
+        self._note_group(gid, f"{nick}({uid})", "戳了戳机器人")
+
+        # 好感度分档 → 反应基调（关好感度就一律熟识档）
+        if self._cfg("affinity_enabled", False):
+            score = self._affection.get(uid)["score"]
+        else:
+            score = self._affection.base
+        if score >= 75:
+            stance = self._POKE_STANCES[2][1]
+        elif score >= 55:
+            stance = self._POKE_STANCES[1][1]
+        elif score <= 35:
+            stance = self._POKE_STANCES[3][1]
+        else:
+            stance = self._POKE_STANCES[0][1]
+
+        provider = self.context.get_using_provider()
+        rt = self._rt(gid)
+        origin = str(rt.get("origin") or "")
+        if provider is None or not origin:
+            return
+        sys_prompt = self._group_system_prompt(gid, "", uid=uid, nick=nick)
+        try:
+            reaction = await complete_text(
+                provider,
+                sys_prompt or "你是群里的 AI 成员",
+                self._POKE_REACT_PROMPT.format(stance=stance),
+                max_tokens=80, temperature=0.9)
+        except Exception as e:
+            logger.warning(f"[qqmind] poke reaction llm failed: {e!r}")
+            return
+        reaction = split_bubbles(
+            (reaction or "").strip(),
+            max_total_chars=int(self._cfg("group_reply_max_chars", 80)))
+        if not reaction:
+            return
+        body = reaction[0].strip()
+        # 回戳：亲近档 50%、熟识档 25% 概率戳回去（OneBot group_poke）
+        if ((score >= 75 and random.random() < 0.5)
+                or (55 <= score < 75 and random.random() < 0.25)):
+            await self._poke_back(gid, uid)
+            body += "（戳回去）"
+        ok = await self._send_bubble(gid, uid, body, True, origin)
+        if not ok:
+            return
+        self._stat("replied", gid)
+        if self._cfg("affinity_enabled", False):
+            self._affection.add(uid, 1)
+        self._count_usage("（戳一戳）", body)
+        # 进日记：轻描淡写一条（不为戳一戳跑压缩模型，省钱）
+        if not self._is_light() and self._memory_mode() != "precise":
+            gm = self._group_mem(gid)
+            gm.diary.add(time.time(), ["戳一戳", "互动"],
+                         f"{nick} 戳了机器人一下，"
+                         f"机器人反应「{body[:30]}」",
+                         tokens=0, title="被戳了一下", content="")
+            logger.info(f"[qqmind] poke reaction for {uid} in {gid}: "
+                        f"{body[:40]}")
+
+    async def _poke_back(self, gid: int, uid: int) -> None:
+        """OneBot group_poke 戳回去；通道不可用/失败静默（文案已带「戳回去」）。"""
+        rt = self._rt(gid)
+        bot = rt.get("bot")
+        self_id = str(rt.get("self_id") or "")
+        if bot is None or not self_id or not hasattr(bot, "call_action"):
+            return
+        try:
+            await bot.call_action("send_group_poke", self_id=int(self_id),
+                                  group_id=int(gid), user_id=int(uid))
+        except Exception as e:
+            logger.debug(f"[qqmind] poke back failed: {e!r}")
+
     # ---------- 挂点 1：事件监听（判读门） ----------
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -749,6 +881,17 @@ class QQMindPlugin(star.Star):
         allowed = self._cfg("allowed_groups") or []
         if allowed and str(gid) not in [str(g) for g in allowed]:
             # 白名单外：qqmind 完全隐身，既不判读也不碰任何标志
+            return
+        # 戳一戳（v0.2.12）：Poke 组件 target_id=自己 → 独立反应路径
+        if _is_poke_self(event.get_messages() or [], self_id):
+            event.should_call_llm(True)   # 不让主模型接管
+            # 先落 origin/bot/self_id（_on_poked 发送要用；notice 事件
+            # 在 normal 流程里也要走这一步，这里提前补齐）
+            rt = self._rt(gid)
+            rt["origin"] = event.unified_msg_origin
+            rt["bot"] = getattr(event, "bot", None)
+            rt["self_id"] = self_id
+            await self._on_poked(gid, uid, event)
             return
         nick = (event.get_sender_name() or "").strip() or str(uid)
         text = (event.message_str or "").strip()

@@ -43,7 +43,7 @@ from .core import diagnostics
 from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 
-PLUGIN_VERSION = "0.2.10"
+PLUGIN_VERSION = "0.2.11"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -72,6 +72,28 @@ def _is_detail_query(query: str) -> bool:
     if not q or len(q) < 4:
         return False
     return bool(_DETAIL_QUERY_RE.search(q))
+
+
+def _quote_reply_prefix(segments) -> str:
+    """把引用消息（Reply 组件）拼成可读前缀：[引用 某某：「原文」]。
+
+    适配器已把被引用原文/引用人填进 Reply 段（sender_nickname/message_str），
+    这里只做鸭子类型提取（有 sender_id+sender_nickname 属性即视为引用段，
+    与 detect_wake 的宽松判定一致），取不到的字段静默降级；最多展开 1 条、
+    原文截 60 字——引用是语境不是正文，别让它吃掉回复预算。
+    """
+    for seg in segments or []:
+        if type(seg).__name__ == "Reply" or (
+                hasattr(seg, "sender_id") and hasattr(seg, "sender_nickname")
+                and not hasattr(seg, "qq")):
+            who = str(getattr(seg, "sender_nickname", "") or "").strip()
+            body = str(getattr(seg, "message_str", "")
+                       or getattr(seg, "text", "") or "").strip()
+            body = re.sub(r"\s+", " ", body)[:60]
+            if not who and not body:
+                return ""
+            return f"[引用 {who or '有人'}：「{body}」] "
+    return ""
 
 # 控制台可读写的配置键（与 _conf_schema.json 对齐）
 _CONFIG_KEYS = (
@@ -464,7 +486,8 @@ class QQMindPlugin(star.Star):
         try:
             out = await provider.text_chat(
                 prompt=prompt, session_id=None,
-                system_prompt=self._group_system_prompt(gid, prompt),
+                system_prompt=self._group_system_prompt(
+                    gid, prompt, uid=uid),
                 contexts=self._group_contexts(
                     gid, uid, skip_last=len(batch) if batch else 0),
                 image_urls=[])
@@ -569,8 +592,16 @@ class QQMindPlugin(star.Star):
                 parts.append("【与本条消息相关的背景】\n" + hits)
         return "\n".join(parts)
 
-    def _group_system_prompt(self, gid: int, query: str = "") -> str:
+    def _group_system_prompt(self, gid: int, query: str = "",
+                             uid: int = 0, nick: str = "") -> str:
         parts = []
+        # 说话人锚定（v0.2.11）：模型靠这个行知道"现在在跟谁说话"——
+        # 群名片随便改，QQ 号才是唯一身份；好感度/备注/日记画像都按它挂。
+        if uid:
+            who = f"{nick}（QQ:{uid}）" if nick else f"QQ:{uid}"
+            parts.append(f"【当前说话人】现在是 {who} 在跟你说话；"
+                         "群聊记录里每条开头的 昵称(QQ号) 就是发言者，"
+                         "同一 QQ 号就是同一个人，别被改名片骗了。")
         persona = self._persona_block()
         if persona:
             parts.append(persona)
@@ -726,7 +757,13 @@ class QQMindPlugin(star.Star):
                     if keyword_wake_enabled(preset) else [])
         wake = detect_wake(text, event.get_messages() or [], self_id, keywords)
         text = await self._vision_annotate(event, text)
-        self._note_group(gid, nick, text or "[图片]")
+        # 引用展开（v0.2.11）：Reply 段的「谁说了什么」拼进正文——适配器把
+        # 引用内容放在 Reply 组件里，message_str 只有纯文本段，不展开的话
+        # 判读和主模型都看不见被引用的那句话（2026-10-30 群内实测半盲）。
+        quote = _quote_reply_prefix(event.get_messages() or [])
+        if quote:
+            text = f"{quote}{text}".strip()
+        self._note_group(gid, f"{nick}({uid})", text or "[图片]")
         rt = self._rt(gid)
         rt["origin"] = event.unified_msg_origin
         rt["bot"] = getattr(event, "bot", None)
@@ -744,7 +781,7 @@ class QQMindPlugin(star.Star):
             # @/引用我 必回：丢掉待回复批，开监控期并直接放行给主模型
             self._degraded.discard(gid)
             self._judge_fail.pop(gid, None)
-            self._record_incoming(gid, uid, nick, text)
+            self._record_incoming(gid, uid, f"{nick}({uid})", text)
             self._cancel_batch(gid)
             s = MonitorSession(followup_rounds=int(self._cfg("followup_rounds", 3)),
                                idle_timeout_min=5)
@@ -762,7 +799,7 @@ class QQMindPlugin(star.Star):
             # 判读连续失败 → 自动降级轻量；只拦主模型
             event.should_call_llm(True)
             return
-        self._record_incoming(gid, uid, nick, text)
+        self._record_incoming(gid, uid, f"{nick}({uid})", text)
         if wake.keyword and keyword_wake_enabled(preset):
             # 关键词：开门（随机读靠它进入监控期），是否回复仍由判读决定
             s = self.sessions.get(key)
@@ -781,7 +818,8 @@ class QQMindPlugin(star.Star):
         if mode in ("batch", "random"):
             # 攒批/随机读：消息进待读批即可，主模型一律不放（判读后主动回复）
             if text:
-                rt["batch"].append({"uid": uid, "nick": nick, "text": text})
+                rt["batch"].append({"uid": uid,
+                                    "nick": f"{nick}({uid})", "text": text})
                 if mode == "batch":
                     max_batch = max(1, int(self._cfg("batch_max_messages", 10)))
                     if batch_should_flush(len(rt["batch"]), max_batch):
@@ -885,7 +923,9 @@ class QQMindPlugin(star.Star):
         k = len(batch) if batch else 1
         ctx_all = self.group_buffer.recent(gid, 7 + k)
         ctx_lines = ctx_all[:-k][-7:] if len(ctx_all) >= k else []
-        pending = ("\n".join(f"{m['nick']}：{m['text']}" for m in batch)
+        # 待判消息与缓冲同格式（nick(uid)：内容），判读门认得出是谁在说
+        pending = ("\n".join(f"{m['nick']}({m['uid']}): {m['text']}"
+                             for m in batch)
                    if batch else f"{nick}：{text}")
         question = ("以上这些消息是在对AI助手说话吗？若在，需要AI深度思考吗？"
                     if batch else
@@ -993,7 +1033,17 @@ class QQMindPlugin(star.Star):
                             for m in p.messages]
             return
         gid = int(event.get_group_id() or 0)
-        profile = self._group_system_prompt(gid, event.message_str or "")
+        gnick = (event.get_sender_name() or "").strip() or str(uid)
+        # 原生管线的用户消息也可能带引用——主模型必须看得见被引用的那句
+        gtext = event.message_str or ""
+        quote = _quote_reply_prefix(event.get_messages() or [])
+        if quote and quote not in gtext:
+            gtext = f"{quote}{gtext}".strip()
+        profile = self._group_system_prompt(gid, gtext, uid=uid, nick=gnick)
+        # 引用过的原文进了 prompt，但 message_str 不动（AstrBot 自身管线兼容）；
+        # 用户消息本体带引用前缀，模型才知道"他引用着那句话在说这个"
+        if quote:
+            req.prompt = f"{quote}{(req.prompt or '').strip()}".strip()
         # 好感度备注/作息（v0.2.8）：群聊回复对当前说话人生效
         if self._cfg("affinity_enabled", False):
             aff_line = profile_to_prompt(self._affection.get(uid))

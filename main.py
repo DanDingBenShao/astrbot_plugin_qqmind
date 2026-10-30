@@ -43,7 +43,7 @@ from .core import diagnostics
 from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 
-PLUGIN_VERSION = "0.2.9"
+PLUGIN_VERSION = "0.2.10"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -53,6 +53,25 @@ _DIARY_CMD_RE = re.compile(r'<查日记"([^"]{1,60})">')
 _GROUP_DIARY_CMD_RE = re.compile(r'<查群日记"([^"]{1,60})">')
 _CROSS_DIARY_CMD_RE = re.compile(r'<查别群日记"(\d{5,12})[:：]([^"]{1,60})">')
 _EXPAND_CMD_RE = re.compile(r'<看日记"#?(\d{1,4})">')
+
+# 详细场景识别（v0.2.10）：对方在要"讲清楚"的内容时放宽群聊截断。
+# 命中面=求做法/求原因/求解释/讲题/求证/纠错，不含纯闲聊。
+_DETAIL_QUERY_RE = re.compile(
+    r"怎么(做|弄|办|改|装|配|算|解|写|用|回|搞|部署|安装|设置|使用|配置|"
+    r"运行|跑|实现|连|接|下载|更新|升级|导入|导出|迁移|删除|注册|登录|"
+    r"同步|备份|恢复|调试|排查|修复|优化|开|关|调|加|去|上|传)|"
+    r"为啥|为什么|什么意思|啥意思|什么区别|"
+    r"详解|详细|细说|展开说|讲讲|讲一下|解释一下|原理|教程|步骤|推导|"
+    r"帮我(看看|算|推|查|分析)|求证|对不对|对吗|哪里(错|出错了)|(错|问题)在(哪|哪里)|"
+    r"解(一)?下|这道题|算式|证明|分析一下|[-+×÷=^]|\d+\s*[-+×÷^]\s*\d")
+
+
+def _is_detail_query(query: str) -> bool:
+    """这条用户消息需要详细回答吗（讲题/教程/求解释）？命中则放宽截断。"""
+    q = (query or "").strip()
+    if not q or len(q) < 4:
+        return False
+    return bool(_DETAIL_QUERY_RE.search(q))
 
 # 控制台可读写的配置键（与 _conf_schema.json 对齐）
 _CONFIG_KEYS = (
@@ -69,7 +88,8 @@ _CONFIG_KEYS = (
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "history_rounds", "max_msg_tokens",
-    "group_reply_max_chars", "vision_enabled", "vision_budget", "vision_model",
+    "group_reply_max_chars", "group_reply_detail_chars",
+    "vision_enabled", "vision_budget", "vision_model",
     "proactive_friends", "proactive_start", "proactive_end",
     "proactive_gap_hours", "proactive_per_day", "proactive_no_reply_limit",
     "share_memory_across_groups",
@@ -458,8 +478,11 @@ class QQMindPlugin(star.Star):
         reply = await self._recall_reply(reply, "group", uid, gid)
         if not reply:
             return
-        bubbles = split_bubbles(
-            reply, max_total_chars=int(self._cfg("group_reply_max_chars", 80)))
+        # v0.2.10：详细场景放宽 @路径的气泡预算（与原生管线同一判定）
+        limit = int(self._cfg("group_reply_max_chars", 80))
+        if _is_detail_query(prompt):
+            limit = max(limit, int(self._cfg("group_reply_detail_chars", 240)))
+        bubbles = split_bubbles(reply, max_total_chars=limit)
         delivered = 0
         for i, b in enumerate(bubbles):
             ok = await self._send_bubble(gid, uid, b, i == 0, origin)
@@ -554,10 +577,15 @@ class QQMindPlugin(star.Star):
         # 群聊长度约束（2026-10-29 群内实测：deepseek 爱列条目写长段）。
         # 无条件注入（v0.2.4：曾有「人设卡已有简短要求就跳过」的条件，但正则把
         # 「口语化」误判成长度规则导致整行从未生效）——和人格不冲突，直接加。
+        # v0.2.10：加「废话预算」约束（截断器放宽了详细场景，提示词端同步
+        # 压废话，两头一起防"说一半"）。
         parts.append("【发言风格（硬性）】群聊回复只许一小段：1~3 句、"
                      f"{self._cfg('group_reply_max_chars', 80)} 字以内，"
-                     "禁止列条目/编号/多段落；除非对方明确要求详细步骤，"
-                     "否则用一两句话把话说完。")
+                     "禁止列条目/编号/多段落，禁止客套开场白和重复对方的话，"
+                     "每个字都要有信息量，废话零容忍；"
+                     "只有对方明确在求教程/讲题/求解释时才允许写长"
+                     f"（上限 {self._cfg('group_reply_detail_chars', 240)} 字），"
+                     "长也只写干货步骤或推导本身，写完就停，别总结别感叹。")
         background = self._persona_background(query)
         if background:
             parts.append(background)
@@ -1150,14 +1178,23 @@ class QQMindPlugin(star.Star):
         if scope == "group":
             # 群聊硬截断（v0.2.4）：AstrBot 渲染按 \n 分段发送，提示词压不住的
             # 长回复在这里按字符预算兜底（私有聊不限——日记问答允许展开说）。
-            new_reply = self._clamp_group_reply(new_reply)
+            # v0.2.10：讲题/教程场景放宽上限——80 一刀切曾把数学推导腰斩。
+            new_reply = self._clamp_group_reply(
+                new_reply,
+                detailed=_is_detail_query(event.message_str or ""))
         if new_reply != reply:
             resp.completion_text = new_reply
         return new_reply
 
-    def _clamp_group_reply(self, reply: str) -> str:
-        """群聊回复字符预算：按行凑，超预算截断收尾。"""
+    def _clamp_group_reply(self, reply: str, detailed: bool = False) -> str:
+        """群聊回复字符预算：按行凑，超预算截断收尾。
+
+        detailed=True（对方在讲题/求教程）时上限放宽到 group_reply_detail_chars：
+        允许把步骤说完，但仍比私聊收紧，守群聊防刷屏底线。
+        """
         limit = int(self._cfg("group_reply_max_chars", 80))
+        if detailed:
+            limit = max(limit, int(self._cfg("group_reply_detail_chars", 240)))
         if limit <= 0 or len(reply) <= limit:
             return reply
         lines = [l for l in reply.split("\n") if l.strip()]

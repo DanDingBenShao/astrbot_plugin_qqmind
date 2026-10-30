@@ -147,6 +147,12 @@
     "default": 80,
     "hint": "群聊防刷屏；私聊/日记回捞不受限。80 约等于两三句话"
   },
+  "group_reply_detail_chars": {
+    "description": "详细场景（讲题/教程/求解释）回复字符上限",
+    "type": "int",
+    "default": 240,
+    "hint": "对方求详细时放宽到这个数，避免推导/步骤被腰斩；仍比私聊收紧"
+  },
   "vision_enabled": {
     "description": "图片识别（表情包/截图看懂后进记忆）",
     "type": "bool",

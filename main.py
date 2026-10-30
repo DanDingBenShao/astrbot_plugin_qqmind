@@ -28,8 +28,8 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.web import request as _web_request
 
 from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
-                   DailyBudget, GroupBuffer, GroupMemory, ImportJob,
-                   MonitorSession, PrivateSession, RateLimiter,
+                   AffectionStore, DailyBudget, GroupBuffer, GroupMemory,
+                   ImportJob, MonitorSession, PrivateSession, RateLimiter,
                    batch_should_flush,
                    detect_wake, est_tokens, thinking_model,
                    keyword_wake_enabled, normalize_preset,
@@ -41,8 +41,9 @@ from .core.vision import describe_image
 from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 from .core import proactive
+from .core.affection import in_schedule, profile_to_prompt
 
-PLUGIN_VERSION = "0.2.7"
+PLUGIN_VERSION = "0.2.8"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -72,6 +73,8 @@ _CONFIG_KEYS = (
     "proactive_friends", "proactive_start", "proactive_end",
     "proactive_gap_hours", "proactive_per_day", "proactive_no_reply_limit",
     "share_memory_across_groups",
+    "affinity_enabled", "affinity_base", "affinity_threshold",
+    "affinity_daily_gain",
     "daily_token_budget", "quota_message", "quota_notices_per_day",
     "bill_est_reply_tokens",
 )
@@ -111,6 +114,10 @@ class QQMindPlugin(star.Star):
             int(self._cfg("proactive_per_day", 1)))
         self._proactive_task: asyncio.Task | None = None
         self._STATS_G: dict[int, dict] = {}   # 分群计数子账（内存态，与 _STATS 同口径）
+        self._affection = AffectionStore(
+            self._private,
+            base=int(self._cfg("affinity_base", 50)),
+            daily_gain_cap=int(self._cfg("affinity_daily_gain", 10)))
         self._register_page_apis()
 
     # ---------- 配置与存储路径 ----------
@@ -163,10 +170,12 @@ class QQMindPlugin(star.Star):
         return p
 
     def _ensure_proactive_loop(self) -> None:
-        """守护循环懒启动（首个私聊会话建立时）；只在白名单非空时跑。"""
+        """守护循环懒启动（首个私聊会话建立时）；
+        白名单非空 或 好感度模式开启 时跑。"""
         if self._proactive_task and not self._proactive_task.done():
             return
-        if not (self._cfg("proactive_friends") or []):
+        if not (self._cfg("proactive_friends") or []) \
+                and not self._cfg("affinity_enabled", False):
             return
         self._proactive_task = asyncio.create_task(self._proactive_loop())
         logger.info("[qqmind] proactive loop started")
@@ -712,6 +721,8 @@ class QQMindPlugin(star.Star):
             s = MonitorSession(followup_rounds=int(self._cfg("followup_rounds", 3)),
                                idle_timeout_min=5)
             self.sessions[key] = s
+            if self._cfg("affinity_enabled", False):
+                self._affection.add(uid, 2)
             logger.info(f"[qqmind] @ wake for {uid} in group {gid}")
             return
         if self._budget_exhausted():
@@ -798,6 +809,8 @@ class QQMindPlugin(star.Star):
         # 思考模式由判读控制（老板 2026-10-29 定案）：判「是|思考」的这一轮
         # 把思考标记挂到事件上，inject_memory 据此切换思考模型；判「直接」不开
         setattr(event, "qqmind_think", bool(think))
+        if self._cfg("affinity_enabled", False):
+            self._affection.add(uid, 1)
         s.touch()   # 额度在 on_llm_response 刷新
 
     async def _read_full(self, event: AstrMessageEvent, gid: int, uid: int,
@@ -830,6 +843,8 @@ class QQMindPlugin(star.Star):
         event.is_at_or_wake_command = True
         event.is_wake = True
         setattr(event, "qqmind_think", bool(think))   # 思考模式由判读控制
+        if self._cfg("affinity_enabled", False):
+            self._affection.add(uid, 1)
 
     async def _judge(self, gid: int, nick: str, text: str,
                      bot_name: str = "", batch=None) -> tuple[bool, bool]:
@@ -951,6 +966,11 @@ class QQMindPlugin(star.Star):
             return
         gid = int(event.get_group_id() or 0)
         profile = self._group_system_prompt(gid, event.message_str or "")
+        # 好感度备注/作息（v0.2.8）：群聊回复对当前说话人生效
+        if self._cfg("affinity_enabled", False):
+            aff_line = profile_to_prompt(self._affection.get(uid))
+            if aff_line:
+                profile = (profile + "\n" + aff_line).strip()
         if profile:
             req.system_prompt = (profile + "\n"
                                  + (req.system_prompt or "")).strip()
@@ -991,6 +1011,11 @@ class QQMindPlugin(star.Star):
         profile_line = p.diary.profile_prompt()
         if profile_line:
             parts.append(profile_line)
+        # 好感度备注/作息（v0.2.8）：只对开启者注入
+        if self._cfg("affinity_enabled", False):
+            aff_line = profile_to_prompt(self._affection.get(p.uid))
+            if aff_line:
+                parts.append(aff_line)
         background = self._persona_background(query)
         if background:
             parts.append(background)
@@ -1169,6 +1194,8 @@ class QQMindPlugin(star.Star):
         self._stat("replied",
                    int(event.get_group_id() or 0)
                    if not event.is_private_chat() else None)
+        if self._cfg("affinity_enabled", False):
+            self._affection.add(uid, 1)
         text = (event.message_str or "").strip()
         if event.is_private_chat():
             p = self._private(uid)
@@ -1227,21 +1254,37 @@ class QQMindPlugin(star.Star):
             pass
 
     async def _proactive_tick(self) -> None:
+        affinity_on = self._cfg("affinity_enabled", False)
         friends = [str(x) for x in (self._cfg("proactive_friends") or [])]
-        if not friends:
+        if affinity_on:
+            # 好感度模式（v0.2.8）：候选=有私聊窗口的活跃用户 ∩ 好感度达标 ∩ 作息匹配
+            threshold = int(self._cfg("affinity_threshold", 70))
+            actives = []
+            for uid, p in self.privates.items():
+                if not p.messages:
+                    continue
+                aff = self._affection.get(uid)
+                if aff["score"] < threshold:
+                    continue
+                if not in_schedule(aff.get("schedule", "")):
+                    continue
+                actives.append((uid, max(
+                    (m.get("ts") or 0) for m in p.messages)))
+        elif friends:
+            # 旧白名单模式（兼容）：安静时段 ∩ 白名单
+            actives = []
+            for f in friends:
+                uid = int(f) if f.isdigit() else 0
+                if uid and uid in self.privates and self.privates[uid].messages:
+                    actives.append((uid, max(
+                        (m.get("ts") or 0) for m in self.privates[uid].messages)))
+        else:
             return
-        if not in_quiet_hours(
+        if not affinity_on and not in_quiet_hours(
                 start=str(self._cfg("proactive_start", "21:00")),
                 end=str(self._cfg("proactive_end", "22:30"))):
             return
         gap = float(self._cfg("proactive_gap_hours", 2.0))
-        # 候选 = 白名单 ∩ 有私聊窗口的用户，按最近活跃排序
-        actives = []
-        for f in friends:
-            uid = int(f) if f.isdigit() else 0
-            if uid and uid in self.privates and self.privates[uid].messages:
-                actives.append((uid, max(
-                    (m.get("ts") or 0) for m in self.privates[uid].messages)))
         uid = pick_target(actives, gap)
         if uid is None:
             return
@@ -1475,6 +1518,32 @@ class QQMindPlugin(star.Star):
             return {"status": "ok", "data": {k: j.progress() for k, j in
                                              list(self._import_jobs.items())[-10:]}}
 
+        async def api_affection_update():
+            """编辑某用户好感度：note（备注）/schedule（作息）/score（手调）。"""
+            payload = await _web_request.json(default={}) or {}
+            uid = int(payload.get("uid") or 0)
+            if uid <= 0:
+                return {"status": "error", "message": "缺少 uid"}
+            if "note" in payload:
+                self._affection.set_note(uid, str(payload.get("note") or ""))
+            if "schedule" in payload:
+                sched = str(payload.get("schedule") or "").strip()
+                from .core.affection import parse_schedule
+                if sched and parse_schedule(sched) is None:
+                    return {"status": "error",
+                            "message": "作息格式应为 HH:MM-HH:MM（如 21:30-23:30）"}
+                self._affection.set_schedule(uid, sched)
+            if "score" in payload:
+                try:
+                    target = max(0, min(100, int(payload["score"])))
+                except (TypeError, ValueError):
+                    return {"status": "error", "message": "score 必须是数字"}
+                d = self._affection.get(uid)
+                d["score"] = target       # 手调直写，不受每日自然增长上限管
+                self._affection._put(uid, d)
+            return {"status": "ok",
+                    "data": self._affection.get(uid)}
+
         async def api_diaries():
             import time as _t
             uid = str(_web_request.query.get("uid") or "").strip()
@@ -1512,11 +1581,15 @@ class QQMindPlugin(star.Star):
                 p = self.privates.get(u)
                 n = p.diary.count() if p else \
                     self._private(u).diary.count()
+                aff = self._affection.get(u)
                 users.append({
                     "uid": str(u), "diaries": n,
                     "window_tokens": p.window_tokens() if p else 0,
                     # QQ 头像直链（qlogo 公共 CDN，无需 API/无需下载中转）
-                    "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={u}&s=100"})
+                    "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={u}&s=100",
+                    "affinity": aff["score"],
+                    "note": aff.get("note", ""),
+                    "schedule": aff.get("schedule", "")})
             users.sort(key=lambda x: -x["diaries"])
             return {"status": "ok", "data": {"users": users}}
 
@@ -1609,6 +1682,9 @@ class QQMindPlugin(star.Star):
         self.context.register_web_api(
             f"/{PLUGIN_NAME}/import/status", api_import_status, ["GET"],
             "qqmind 导入进度")
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/affection/update", api_affection_update, ["POST"],
+            "qqmind 编辑好感度/备注/作息")
 
     def _diagnostics_snapshot(self) -> dict:
         """组装诊断包（WebUI 与命令共用）。隐私：日记正文不出包。"""

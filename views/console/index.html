@@ -460,9 +460,45 @@
         left.textContent = u.uid;
         const right = document.createElement('span');
         right.className = 'n';
-        right.textContent = `${u.diaries} 篇日记 · 窗口 ${u.window_tokens} tok`;
+        const affBit = (typeof u.affinity === 'number')
+          ? ` · 💙${u.affinity}` : '';
+        right.textContent = `${u.diaries} 篇日记 · 窗口 ${u.window_tokens} tok${affBit}`;
         div.style.cssText += ';display:flex;align-items:center;gap:8px';
         div.append(av, left, right);
+        // 好感度行内编辑（备注/作息/分数），点齿轮展开，点头像行进日记
+        const gear = document.createElement('button');
+        gear.textContent = '✎';
+        gear.style.cssText = 'margin-left:auto;flex:none;border:none;background:none;cursor:pointer;color:#888';
+        gear.title = '编辑好感度/备注/作息';
+        gear.onclick = (e) => {
+          e.stopPropagation();
+          let editor = div.querySelector('.aff-editor');
+          if (editor) { editor.remove(); return; }
+          editor = document.createElement('div');
+          editor.className = 'aff-editor';
+          editor.style.cssText = 'flex-basis:100%;display:flex;flex-direction:column;gap:4px;padding:6px;background:#f7f9fc;border-radius:8px';
+          editor.innerHTML =
+            `<label>好感度 <b>${u.affinity ?? '-'}</b>/100（手调）<input type="number" min="0" max="100" value="${u.affinity ?? 50}" style="width:70px"></label>` +
+            `<label>备注（作息/称呼/雷点）<textarea rows="2" style="width:100%">${(u.note||'').replace(/</g,'&lt;')}</textarea></label>` +
+            `<label>活跃时段 HH:MM-HH:MM（留空=不限制）<input type="text" value="${u.schedule||''}" placeholder="21:30-23:30" style="width:120px"></label>` +
+            `<button style="align-self:flex-start">保存</button>`;
+          const [scoreI, noteI, schedI, btn] = [
+            editor.querySelector('input'), editor.querySelector('textarea'),
+            editor.querySelectorAll('input')[1], editor.querySelector('button')];
+          btn.onclick = async () => {
+            btn.disabled = true;
+            try {
+              await api.apiPost('affection/update', {
+                uid: parseInt(u.uid, 10),
+                score: parseInt(scoreI.value, 10) || 0,
+                note: noteI.value, schedule: schedI.value.trim()});
+              btn.textContent = '已保存 ✓';
+              setTimeout(() => loadUsers(), 600);
+            } catch (err) { btn.textContent = '失败：' + err.message; btn.disabled = false; }
+          };
+          div.appendChild(editor);
+        };
+        div.append(av, left, right, gear);
         div.onclick = () => openDiary(u.uid);
         $('user-list').appendChild(div);
       }

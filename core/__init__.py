@@ -18,3 +18,5 @@ from .vision import (VisionBudget, VISION_PROMPT, describe_image,
                      extract_image_urls, image_bytes_for_vision)
 from .proactive import (ProactiveState, build_greeting, in_quiet_hours,
                         memory_digest, pick_target)
+from .affection import (AffectionStore, in_schedule, parse_schedule,
+                        profile_to_prompt)

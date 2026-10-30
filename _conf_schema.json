@@ -207,6 +207,28 @@
     "default": false,
     "hint": "开启后 A 群的 AI 能看到 B 群（白名单内）的日记标题并按需寻回；注意群间隐私"
   },
+  "affinity_enabled": {
+    "description": "好感度系统（按人记分+备注+作息，主动聊天按好感度触发）",
+    "type": "bool",
+    "default": false
+  },
+  "affinity_base": {
+    "description": "好感度初始分（0~100）",
+    "type": "int",
+    "default": 50
+  },
+  "affinity_threshold": {
+    "description": "主动聊天的好感度门槛",
+    "type": "int",
+    "default": 70,
+    "hint": "只有达到该分数的用户才会被主动找；控制在台可对单人手调分数"
+  },
+  "affinity_daily_gain": {
+    "description": "每人每天自然增长上限（防刷分）",
+    "type": "int",
+    "default": 10,
+    "hint": "互动加分：判是+1、回复后+1、被@额外+2；手调分数不受限"
+  },
   "judge_fail_threshold": {
     "description": "判读连续失败几次自动降级轻量（等下一条@恢复）",
     "type": "int",

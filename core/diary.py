@@ -91,6 +91,7 @@ class DiaryStore:
             title   TEXT NOT NULL DEFAULT '',
             tags    TEXT NOT NULL DEFAULT '[]',
             summary TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
             tokens  INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_entries_ts ON entries(ts);
@@ -126,6 +127,7 @@ class DiaryStore:
         ).fetchone()
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(entries)")}
         upgrading_title = row is not None and "title" not in cols
+        upgrading_content = row is not None and "content" not in cols
         # external content 的 fts 列必须真实存在于 content 表——grams 要加在 entries 上；
         # 已存在的旧 fts（无 grams）只能重建
         fts_cols = {r[1] for r in self._db.execute("PRAGMA table_info(fts)")}
@@ -141,6 +143,10 @@ class DiaryStore:
         if upgrading_title:
             self._db.execute(
                 "ALTER TABLE entries ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        if upgrading_content:
+            # v0.2.5 三层日记：content 列存原文选段（第三层），旧库默认空=没有全文
+            self._db.execute(
+                "ALTER TABLE entries ADD COLUMN content TEXT NOT NULL DEFAULT ''")
         need_rebuild = (rebuilding or upgrading_title
                         or self._meta_get("fts_ver") != self._FTS_VER)
         if need_rebuild:
@@ -185,7 +191,7 @@ class DiaryStore:
 
     # ---------- 写 ----------
     def add(self, ts: float, tags: list[str], summary: str,
-            tokens: int = 0, title: str = "") -> int:
+            tokens: int = 0, title: str = "", content: str = "") -> int:
         tags = [t.strip() for t in (tags or []) if t and t.strip()][:8]
         title = (title or "").strip()[:40]
         tags_json = json.dumps(tags, ensure_ascii=False)
@@ -193,10 +199,11 @@ class DiaryStore:
         # grams 是 entries 的真实列（external content 的 fts 从这里取），
         # INSERT 触发器自动带进 fts，无需手动同步
         cur = self._db.execute(
-            "INSERT INTO entries(ts, title, tags, summary, tokens, grams) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO entries(ts, title, tags, summary, tokens, grams, content) "
+            "VALUES (?,?,?,?,?,?,?)",
             (float(ts), title, tags_json,
-             (summary or "").strip(), int(tokens), grams))
+             (summary or "").strip(), int(tokens), grams,
+             (content or "").strip()))
         self._db.commit()
         return cur.lastrowid
 
@@ -215,8 +222,30 @@ class DiaryStore:
             tags = "、".join(json.loads(r["tags"]))
             title = (r["title"] or "").strip()
             head = f"{t} {title} #{r['id']}" if title else f"{t} #{r['id']}"
-            lines.append(f"【{head}】标签：{tags}\n{r['summary']}")
+            # 三层日记（v0.2.5）：#id 是钥匙，「▷」表示存有原话全文可展开
+            mark = " ▷" if (r["content"] or "").strip() else ""
+            lines.append(f"【{head}】{mark}标签：{tags}\n{r['summary']}")
         return "\n".join(lines)
+
+    def expand(self, entry_id: int) -> str:
+        """第三层：按 id 取单篇全文（原文选段）。没有全文返回提示。"""
+        r = self._db.execute(
+            "SELECT * FROM entries WHERE id=?", (int(entry_id),)).fetchone()
+        if r is None:
+            return f"（日记 #{int(entry_id)} 不存在）"
+        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"]))
+        tags = "、".join(json.loads(r["tags"]))
+        head = f"{t} {(r['title'] or '').strip()} #{r['id']}".strip()
+        body = (r["content"] or "").strip()
+        if not body:
+            return f"【{head}】标签：{tags}\n（这篇只有概要，没存原话）\n{r['summary']}"
+        return f"【{head}】标签：{tags}\n概要：{r['summary']}\n原话：\n{body}"
+
+    def has_content(self, entry_id: int) -> bool:
+        """该篇是否存了全文（决定回捞时要不要跑第三层）。"""
+        r = self._db.execute(
+            "SELECT content FROM entries WHERE id=?", (int(entry_id),)).fetchone()
+        return bool(r and (r["content"] or "").strip())
 
     def recent(self, n: int = 5) -> str:
         """最近的日记（倒序），给模型做「标题行」提示或翻看。"""

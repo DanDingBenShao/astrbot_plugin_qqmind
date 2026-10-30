@@ -21,7 +21,9 @@ COMPRESS_PROMPT = (
     "只输出一行 JSON（不要代码块、不要解释）：\n"
     '{"title": "一句话标题，10字以内", "tags": ["标签1", "标签2"], '
     '"summary": "两三句话概括：聊了什么、有什么值得记住的'
-    '（关键事实/约定/情绪/偏好），用第二人称「你」称呼对方"}\n'
+    '（关键事实/约定/情绪/偏好），用第二人称「你」称呼对方", '
+    '"content": "值得留原话的部分：直接引用1~3句对方说过的重要原话，'
+    '没有值得留的就输出空字符串"}\n'
     "标签 2~5 个中文词。"
 )
 
@@ -95,10 +97,12 @@ class PrivateSession:
         return s[:limit] + ("…" if len(s) > limit else "")
 
     @staticmethod
-    def parse_compress_output(out: str) -> tuple[str, list[str], str] | None:
+    def parse_compress_output(out: str) -> tuple[str, list[str], str, str] | None:
         """解析压缩输出 JSON（容错：剥代码块围栏）。失败返回 None。
 
-        返回 (title, tags, summary)；title 缺失时由摘要兜底生成。
+        返回 (title, tags, summary, content)；content 是第三层原文选段
+        （旧模型不输出该字段时为空串，三层退化为两层）。
+        title 缺失时由摘要兜底生成。
         """
         t = (out or "").strip()
         if t.startswith("```"):
@@ -108,8 +112,10 @@ class PrivateSession:
             title = str(d.get("title") or "").strip()
             tags = [str(x) for x in (d.get("tags") or [])]
             summary = str(d.get("summary") or "").strip()
+            content = str(d.get("content") or "").strip()
             if summary:
-                return (title or PrivateSession.derive_title(summary)), tags, summary
+                return ((title or PrivateSession.derive_title(summary)),
+                        tags, summary, content[:600])
         except Exception:
             pass
         return None
@@ -130,10 +136,11 @@ class PrivateSession:
             parsed = self.parse_compress_output(out)
             if not parsed:
                 return 0        # 压缩失败：原文留下轮再试
-            title, tags, summary = parsed
+            title, tags, summary, content = parsed
             first_ts = msgs[0].get("ts") or time.time()
             tok = sum(est_tokens(m["content"]) for m in msgs)
-            self.diary.add(first_ts, tags, summary, tok, title=title)
+            self.diary.add(first_ts, tags, summary, tok, title=title,
+                           content=content)
             del self.messages[:len(msgs)]
             return tok + 200
         except Exception as e:

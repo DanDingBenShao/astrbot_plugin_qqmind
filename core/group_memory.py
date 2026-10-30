@@ -24,7 +24,9 @@ GROUP_COMPRESS_PROMPT = (
     "你是群聊记忆整理助手。把下面这段群聊压缩成一篇群日记，帮机器人长期记住这件事。\n"
     "只输出一行 JSON（不要代码块、不要解释）：\n"
     '{"title": "一句话标题，10字以内", "tags": ["标签1", "标签2"], '
-    '"summary": "两三句话概括：聊了什么、有哪些关键事实/约定/人物关系/情绪"}\n'
+    '"summary": "两三句话概括：聊了什么、有哪些关键事实/约定/人物关系/情绪", '
+    '"content": "值得留原话的部分：直接引用1~3句最能代表这段对话的原话（保留说话人），'
+    '没有值得留的就输出空字符串"}\n'
     "标签 2~5 个中文词。"
 )
 
@@ -172,12 +174,12 @@ class GroupMemory:
         parsed = PrivateSession.parse_compress_output(out)
         if not parsed:
             return 0
-        title, tags, summary = parsed
+        title, tags, summary, content = parsed
         if tags_extra:
             tags = list(dict.fromkeys([str(t) for t in tags_extra] + tags))[:8]
         tok = sum(est_tokens(m.get("content", "")) for m in msgs)
         self.diary.add(msgs[0].get("ts") or time.time(), tags, summary, tok,
-                       title=title)
+                       title=title, content=content)
         self.save()
         return tok + 200
 

@@ -141,6 +141,12 @@
     "default": 650,
     "hint": "统计展示用，不影响实际行为；分层/全量档建议 800-1500"
   },
+  "group_reply_max_chars": {
+    "description": "群聊回复字符上限（超出截断，0=不限制）",
+    "type": "int",
+    "default": 80,
+    "hint": "群聊防刷屏；私聊/日记回捞不受限。80 约等于两三句话"
+  },
   "judge_fail_threshold": {
     "description": "判读连续失败几次自动降级轻量（等下一条@恢复）",
     "type": "int",

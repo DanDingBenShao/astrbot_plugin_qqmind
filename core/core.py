@@ -19,16 +19,22 @@ from pathlib import Path
 # ---------- 判读提示词（三态双字段） ----------
 # v3（2026-10-29 瘦身实测）：v1 660字/585tok → v3 271字/241tok，真实 API 30 条
 # 混合用例正确率 24/29 vs 20/29（v3 反超），成本省 40%。示例段是质量锚，必须保留。
+# v4（2026-10-29 群内实测收紧）：默认判否——只明确对AI说的话才判是；
+# 别的机器人刷屏/群友互相接话一概否（否则接话链条每条都被判是，回复爆炸）。
 JUDGE_PROMPT = (
     "你是群聊意图分类器。AI助手在群里（可能被叫名字/@）。"
     "提示里若给出「AI助手在本群的名字是X」，消息里叫X就是在叫它。\n"
-    "判【否】：在和别人说话、接别人的话、自言自语、对全群喊话。\n"
-    "判【是】：叫它/@它/问它请求它，或顺着AI刚说的话继续。"
-    "其中要创作（写诗/讲故事/出主意/起名/画图）或要推理（数学/谜题）→是|思考；"
-    "打招呼闲聊简单问答→是|直接；拿不准→是|直接。\n"
-    "示例（AI本群叫「小桃」）：\n"
+    "默认判【否】：在和别人说话、接别人的话、自言自语、对全群喊话、"
+    "夸奖或调侃第三方、和其他机器人互动、@别人。"
+    "拿不准一律否。\n"
+    "判【是】必须满足：消息在明确地对AI说话——叫它/@它/问它请求它，"
+    "或紧接着AI上一句话回应它本人。\n"
+    "判是后分：要创作（写诗/讲故事/出主意/起名/画图）或要推理（数学/谜题）"
+    "→是|思考；打招呼闲聊简单问答→是|直接。\n"
+    "示例（AI本群叫「小桃」，群里另有机器人「波奇」）：\n"
     "「小桃，帮我想个周末去哪玩的点子」→是|思考；「@小桃 在吗」→是|直接；"
-    "「今天天气不错」→否。\n"
+    "「波奇画得真好」→否；「今天天气不错」→否；"
+    "「@波奇 再来一张」→否。\n"
     "只输出一行，三选一：是|思考、是|直接、否。"
 )
 
@@ -277,8 +283,13 @@ def wrap_safe(line: str, max_cols: int = _PHONE_COLS) -> list[str]:
     return pieces or [line]
 
 
-def split_bubbles(reply: str, max_bubbles: int = 5) -> list[str]:
-    """回复 → 手机风格多条短消息：按换行拆、接回被切的颜文字、超宽折行、超长合并尾部。"""
+def split_bubbles(reply: str, max_bubbles: int = 5,
+                  max_total_chars: int = 0) -> list[str]:
+    """回复 → 手机风格多条短消息：按换行拆、接回被切的颜文字、超宽折行、超长合并尾部。
+
+    max_total_chars>0 时整条回复硬截断（v0.2.4 群聊防刷屏：deepseek 爱写
+    攻略长文，提示词压不住的部分在这里兜底）——按气泡凑，凑满预算为止。
+    """
     raw = [b.strip() for b in (reply or "").split("\n") if b.strip()]
     raw = merge_broken_kaomoji(raw)
     bubbles: list[str] = []
@@ -286,6 +297,36 @@ def split_bubbles(reply: str, max_bubbles: int = 5) -> list[str]:
         bubbles.extend(wrap_safe(b))
     if not bubbles:
         bubbles = ["……"]
+    if max_total_chars and max_total_chars > 0:
+        kept: list[str] = []
+        used = 0
+
+        def vis_len(s: str) -> int:
+            # 折行符不算显示宽度（手机上换行不占字符预算）
+            return len(s.replace("\n", ""))
+
+        for b in bubbles:
+            room = max_total_chars - used
+            if room <= 0:
+                break
+            n = vis_len(b)
+            if n <= room:
+                kept.append(b)
+                used += n
+            else:
+                # 切到预算内并给省略号留位（省略号本身占显示宽度）
+                cut = b[:max(1, room - 1)].rstrip("，、；：") + "…"
+                kept.append(cut)
+                used = max_total_chars
+                break
+        if kept and used >= max_total_chars:
+            kept[-1] = kept[-1].rstrip("，、；：：，、")
+            if not kept[-1].endswith("…"):
+                kept[-1] += "…"
+        if kept:
+            bubbles = kept
+        if not bubbles:
+            bubbles = [bubbles[0][:max_total_chars]] if bubbles else ["……"]
     if len(bubbles) > max_bubbles:
         bubbles = bubbles[:max_bubbles - 1] + ["\n".join(bubbles[max_bubbles - 1:])]
     return bubbles

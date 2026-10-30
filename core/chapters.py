@@ -14,6 +14,13 @@ from pathlib import Path
 
 from .fts_zh import bigrams, grams_query
 
+# 泛词二字组：日常闲聊高频出现，命中它们不构成话题相关（2026-10-29 群测：
+# 「今天天气怎么样」被标题「怎么办」的「怎么」捞走、「晚饭吃什么好」被「为什么」捞走）。
+_STOP_GRAMS = frozenset(
+    "怎么 怎么办 什么 为什么 哪里 哪个 这样 那样 这些 那些 是不 不是 还是 "
+    "可以 就是 但是 所以 如果 现在 时候 大家 你们 我们 自己 一个 一点 有没 没有 "
+    "来了 来了 好了 行了 知道 觉得 感觉 今天 明天 昨天 上午 下午 晚上 早上".split())
+
 _SAFE_RE = re.compile(r'[\\/:*?"<>|\s]+')
 
 
@@ -173,7 +180,9 @@ class ChapterStore:
         """关键词命中 → 返回摘要+正文（最多 n 篇）。无命中返回空串。
 
         检索面 = 标题+摘要的二字组（fts_zh.grams_query，BM25 排序）；
-        自然句查询的相邻二字组 OR 能召回「摘要含这些词」的篇章。
+        FTS 命中后二次把关（防泛词误召回，如「今天天气怎么样」被标题里的
+        「怎么办」捞走）：命中词里至少 2 个不同的查询二字组出现在该篇
+        标题+摘要里，或恰好 1 个但该组来自标题（标题词是强信号）。
         """
         q = (query or "").strip()
         if not q:
@@ -184,10 +193,21 @@ class ChapterStore:
             try:
                 rows = self._db.execute(
                     "SELECT c.* FROM ch_fts JOIN chapters c ON c.id = ch_fts.rowid "
-                    "WHERE ch_fts MATCH ? ORDER BY bm25(ch_fts) LIMIT ?",
-                    (match, max(1, min(int(n), 10)))).fetchall()
+                    "WHERE ch_fts MATCH ? ORDER BY bm25(ch_fts) LIMIT "
+                    f"{max(1, min(int(n) * 4, 10))}",
+                    (match,)).fetchall()
             except sqlite3.OperationalError:
                 rows = []
+        if rows:
+            q_grams = set(bigrams(q).split()) - _STOP_GRAMS
+            solid = []
+            for r in rows:
+                r_grams = set((r["grams"] or "").split())
+                overlap = q_grams & r_grams
+                title_grams = set(bigrams(r["title"] or "").split())
+                if len(overlap) >= 2 or (overlap and overlap <= title_grams):
+                    solid.append(r)
+            rows = solid[:max(1, min(int(n), 10))]
         if not rows:
             rows = self._db.execute(
                 "SELECT * FROM chapters WHERE title LIKE ? OR summary LIKE ? "

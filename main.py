@@ -37,7 +37,7 @@ from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
 from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 
-PLUGIN_VERSION = "0.2.2"
+PLUGIN_VERSION = "0.2.5"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -45,6 +45,7 @@ JUDGE_PROMPT_LEN = est_tokens(JUDGE_PROMPT)   # 判读 system 提示词的 token
 
 _DIARY_CMD_RE = re.compile(r'<查日记"([^"]{1,60})">')
 _GROUP_DIARY_CMD_RE = re.compile(r'<查群日记"([^"]{1,60})">')
+_EXPAND_CMD_RE = re.compile(r'<看日记"#?(\d{1,4})">')
 
 # 控制台可读写的配置键（与 _conf_schema.json 对齐）
 _CONFIG_KEYS = (
@@ -61,6 +62,7 @@ _CONFIG_KEYS = (
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "history_rounds", "max_msg_tokens",
+    "group_reply_max_chars",
     "daily_token_budget", "quota_message", "quota_notices_per_day",
     "bill_est_reply_tokens",
 )
@@ -368,7 +370,8 @@ class QQMindPlugin(star.Star):
         reply = await self._recall_reply(reply, "group", uid, gid)
         if not reply:
             return
-        bubbles = split_bubbles(reply)
+        bubbles = split_bubbles(
+            reply, max_total_chars=int(self._cfg("group_reply_max_chars", 80)))
         delivered = 0
         for i, b in enumerate(bubbles):
             ok = await self._send_bubble(gid, uid, b, i == 0, origin)
@@ -460,6 +463,13 @@ class QQMindPlugin(star.Star):
         persona = self._persona_block()
         if persona:
             parts.append(persona)
+        # 群聊长度约束（2026-10-29 群内实测：deepseek 爱列条目写长段）。
+        # 无条件注入（v0.2.4：曾有「人设卡已有简短要求就跳过」的条件，但正则把
+        # 「口语化」误判成长度规则导致整行从未生效）——和人格不冲突，直接加。
+        parts.append("【发言风格（硬性）】群聊回复只许一小段：1~3 句、"
+                     f"{self._cfg('group_reply_max_chars', 80)} 字以内，"
+                     "禁止列条目/编号/多段落；除非对方明确要求详细步骤，"
+                     "否则用一两句话把话说完。")
         background = self._persona_background(query)
         if background:
             parts.append(background)
@@ -658,14 +668,11 @@ class QQMindPlugin(star.Star):
         s.judged += 1
         bot_name = await self._bot_group_name(event, gid)
         ok, think = await self._judge(gid, nick, text, bot_name)
-        self._STATS["judged"] += 1
         s = self.sessions.get(key)
         if not s or not s.monitoring:
             event.should_call_llm(True)
             return
         if not ok:
-            self._STATS["blocked"] += 1
-            self._bill_saved(1)
             s.rounds_left -= 1
             if s.rounds_left <= 0:
                 self.sessions.pop(key, None)
@@ -703,10 +710,7 @@ class QQMindPlugin(star.Star):
             return
         bot_name = await self._bot_group_name(event, gid)
         ok, think = await self._judge(gid, nick, text, bot_name)
-        self._STATS["judged"] += 1
         if not ok:
-            self._STATS["blocked"] += 1
-            self._bill_saved(1)
             event.should_call_llm(True)
             return
         if not self._allow_reply(gid):
@@ -778,10 +782,16 @@ class QQMindPlugin(star.Star):
         self._degraded.discard(gid)
         ok, think = verdict
         self._STATS["judge_think"] += int(think)
-        # 账单：判读侧真实消耗（system+ask+输出）。拦截计数由调用方负责，
-        # 这里不记 blocked/saved，避免全量档/监控期两路重复计账
+        # 账单唯一计账点（v0.2.3）：读/拦只在判读出口记，三条调用路径
+        # （全量/监控期/攒批）自动统一——攒批此前整条路径漏计，账单「读」严重偏小。
+        # 读=k 条（整批判读看了 k 条）；拦=1 次回复决策（整批判否也只省一次回复）
+        k = len(batch) if batch else 1
         self._STATS["judge_in"] += est_tokens(ask) + JUDGE_PROMPT_LEN
         self._STATS["judge_out"] += est_tokens(out_text)
+        self._STATS["judged"] += k
+        if not ok:
+            self._STATS["blocked"] += 1
+            self._bill_saved(1)
         logger.info(f"[qqmind] judge -> {'是|思考' if think else ('是|直接' if ok else '否')}: {pending[:40]}")
         return ok, think
 
@@ -906,13 +916,48 @@ class QQMindPlugin(star.Star):
         if provider is None:
             return reply.replace(m.group(0), "").strip() or \
                 "我翻了一下日记，但没找到合适的答案。"
+        # 三层日记（v0.2.5）：结果行带 ▷ 的篇目存有原话全文；模型想看细节
+        # 就回 <看日记"#id">（最多两轮，防套娃烧 token）
+        if scope == "private":
+            expand_hint = ("结果里带 ▷ 的篇目存有当天的原话；"
+                           "只有需要引用原话才能回答时，"
+                           "才输出 <看日记\"#编号\"> 展开一篇（最多展开一篇）。"
+                           "概要够答就直接答。")
+        else:
+            expand_hint = ("结果里带 ▷ 的篇目存有当时的群聊原话；"
+                           "只有需要引用原话才能回答时，"
+                           "才输出 <看日记\"#编号\"> 展开一篇（最多展开一篇）。"
+                           "概要够答就直接答。")
         try:
             out = await provider.text_chat(
                 prompt=(f"（你刚才想查记忆：{query}）\n查询结果：\n{found}\n"
-                        "请根据查询结果，用自然的语气回答对方。"),
+                        + expand_hint
+                        + "\n请根据查询结果，用自然的语气回答对方。"),
                 session_id=None, system_prompt=system,
                 contexts=contexts, image_urls=[])
             new_reply = (out.completion_text or "").strip()
+            expand_m = _EXPAND_CMD_RE.search(new_reply)
+            if expand_m:
+                # 第三层：模型点名要看某篇全文——单篇展开后重答一次
+                eid = int(expand_m.group(1))
+                if scope == "private":
+                    detail = self._private(uid).diary.expand(eid)
+                else:
+                    detail = self._group_mem(gid).diary.expand(eid)
+                out2 = await provider.text_chat(
+                    prompt=(f"（你刚才想查记忆：{query}）\n"
+                            f"查询结果（概要）：\n{found}\n"
+                            f"你选中展开的第 {eid} 篇全文：\n{detail}\n"
+                            "请结合这些信息，用自然的语气回答对方。"),
+                    session_id=None, system_prompt=system,
+                    contexts=contexts, image_urls=[])
+                new_reply = (out2.completion_text or "").strip()
+                self._count_usage(found + detail, new_reply, resp=out2)
+                clean = _EXPAND_CMD_RE.sub("", new_reply)
+                clean = _DIARY_CMD_RE.sub("", clean)
+                clean = _GROUP_DIARY_CMD_RE.sub("", clean).strip()
+                logger.info(f"[qqmind] diary recall '{query}' expanded #{eid}")
+                return clean or new_reply
             if new_reply:
                 self._count_usage(found, new_reply, resp=out)
                 clean = _DIARY_CMD_RE.sub("", new_reply)
@@ -931,9 +976,36 @@ class QQMindPlugin(star.Star):
         scope = "private" if event.is_private_chat() else "group"
         gid = int(event.get_group_id() or 0)
         new_reply = await self._recall_reply(reply, scope, uid, gid)
+        if scope == "group":
+            # 群聊硬截断（v0.2.4）：AstrBot 渲染按 \n 分段发送，提示词压不住的
+            # 长回复在这里按字符预算兜底（私有聊不限——日记问答允许展开说）。
+            new_reply = self._clamp_group_reply(new_reply)
         if new_reply != reply:
             resp.completion_text = new_reply
         return new_reply
+
+    def _clamp_group_reply(self, reply: str) -> str:
+        """群聊回复字符预算：按行凑，超预算截断收尾。"""
+        limit = int(self._cfg("group_reply_max_chars", 80))
+        if limit <= 0 or len(reply) <= limit:
+            return reply
+        lines = [l for l in reply.split("\n") if l.strip()]
+        kept: list[str] = []
+        used = 0
+        for l in lines:
+            room = limit - used
+            if room <= 0:
+                break
+            if len(l) <= room:
+                kept.append(l)
+                used += len(l)
+            else:
+                kept.append(l[:room])
+                used = limit
+                break
+        out = "\n".join(kept).rstrip("，、；：") + ("…" if used >= limit else "")
+        logger.info(f"[qqmind] group reply clamped: {len(reply)} -> {len(out)} chars")
+        return out
 
     # ---------- 挂点 3：LLM 回复后（落盘/压缩/额度刷新） ----------
     @on_llm_response()
@@ -1093,7 +1165,8 @@ class QQMindPlugin(star.Star):
                 "ts": _t.strftime("%Y-%m-%d %H:%M", _t.localtime(r["ts"])),
                 "title": (r["title"] or "").strip() or _short_title(r["summary"]),
                 "tags": "、".join(json.loads(r["tags"])),
-                "summary": r["summary"]} for r in rows]
+                "summary": r["summary"],
+                "content": (r["content"] or "").strip()} for r in rows]
             return {"status": "ok", "data": {"entries": entries}}
 
         async def api_sessions():
@@ -1309,17 +1382,46 @@ class QQMindPlugin(star.Star):
 
     @filter.command("日记")
     async def cmd_diary(self, event: AstrMessageEvent):
-        """翻日记：/日记 最近 或 /日记 关键词 或 /日记 昨天"""
+        """翻日记：/日记 最近 或 /日记 关键词 或 /日记 昨天 或 /日记 #3 看全文"""
         uid = int(event.get_sender_id() or 0)
         if not event.is_private_chat():
             yield event.plain_result("日记是私聊的记忆，私聊我再看哦")
             return
         p = self._private(uid)
         arg = (event.message_str or "").strip()
+        if arg.startswith("#") and arg[1:].isdigit():
+            yield event.plain_result(p.diary.expand(int(arg[1:])))
+            return
         if not arg or arg in ("最近", "列表"):
             out = p.diary.recent(5)
         elif parse_time_query(arg):
             out = p.diary.by_time(arg)
         else:
             out = p.diary.search(arg)
+        out += "\n（看某篇原话：/日记 #编号）"
+        yield event.plain_result(out)
+
+    @filter.command("群日记")
+    async def cmd_group_diary(self, event: AstrMessageEvent):
+        """翻本群日记（三层递进）：/群日记 最近|关键词|时间 或 /群日记 #3 看原话"""
+        if event.is_private_chat():
+            yield event.plain_result("群日记要在群里看哦，私聊找我看 /日记～")
+            return
+        gid = int(event.get_group_id() or 0)
+        allowed = self._cfg("allowed_groups") or []
+        if allowed and str(gid) not in [str(g) for g in allowed]:
+            yield event.plain_result("这个群没有开通我的记忆功能～")
+            return
+        gm = self._group_mem(gid)
+        arg = (event.message_str or "").strip()
+        if arg.startswith("#") and arg[1:].isdigit():
+            yield event.plain_result(gm.diary.expand(int(arg[1:])))
+            return
+        if not arg or arg in ("最近", "列表"):
+            out = gm.diary.recent(5)
+        elif parse_time_query(arg):
+            out = gm.diary.by_time(arg)
+        else:
+            out = gm.diary.search(arg)
+        out += "\n（▷=存有原话，看原话发：/群日记 #编号）"
         yield event.plain_result(out)

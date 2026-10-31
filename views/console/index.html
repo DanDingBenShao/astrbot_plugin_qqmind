@@ -346,6 +346,14 @@
       </div>
     </div>
 
+    <div class="acc" id="acc-live" data-layer="live">
+      <div class="acc-head">
+        <span class="acc-name">活人模板</span>
+        <span class="acc-preview empty">默认（来自真人语料）</span>
+        <span class="acc-edit">编辑 ›</span>
+      </div>
+    </div>
+
     <div class="acc" id="acc-legacy" data-layer="legacy">
       <div class="acc-head">
         <span class="acc-name">旧版单卡（备用）</span>
@@ -415,7 +423,7 @@
     precise_budget_tokens: 4000, daily_token_budget: 0,
     quota_message: '今天的额度用完啦，明天再来找我吧～',
     quota_notices_per_day: 2, persona_shallow: '', persona_deep: '',
-    persona_text: '', persona_pack: '', private_budget_tokens: 10000
+    persona_text: '', persona_pack: '', private_budget_tokens: 10000, persona_live_mode: ''
   };
   const state = { cfg: {}, preset: 'light', keywords: [], packs: [],
                   pack: '', active: '', chapters: [] };
@@ -869,6 +877,12 @@
       hint: '浅层和深层都为空时，才会用这张单卡。新配置建议用上面两层。',
       key: 'persona_text',
       placeholder: '这里写一整段人设。'
+    },
+    live: {
+      title: '编辑活人模板',
+      hint: '怎么说话像活人（独立于人格）。角色包带 live_mode.md 时以包内为准；清空保存=关闭。',
+      key: 'persona_live_mode',
+      placeholder: '例如：1. 短，能 15 字说完别写 30 字；2. 默认句尾不带标点…'
     }
   };
 

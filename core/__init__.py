@@ -11,6 +11,7 @@ from .group import (DEFAULT_PRESET, PRESETS, READ_MODES, RateLimiter, WakeHit,
                     normalize_preset, preset_memory_mode, preset_read_mode,
                     resolve_read_mode)
 from .private import PrivateSession
+from .pool import CandidatePool
 from .group_memory import GroupMemory
 from .importer import (ImportJob, PROFILE_PROMPT, chunk_messages,
                        extract_conversations_json, extract_profile,

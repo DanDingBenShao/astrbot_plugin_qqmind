@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import random
+from pathlib import Path
 import re
 import time
 
@@ -28,9 +29,9 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.web import request as _web_request
 
 from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
-                   AffectionStore, DailyBudget, GroupBuffer, GroupMemory,
-                   ImportJob, MonitorSession, PrivateSession, RateLimiter,
-                   batch_should_flush,
+                   AffectionStore, CandidatePool, DailyBudget, GroupBuffer,
+                   GroupMemory, ImportJob, MonitorSession, PrivateSession,
+                   RateLimiter, batch_should_flush,
                    detect_wake, est_tokens, thinking_model,
                    keyword_wake_enabled, normalize_preset,
                    parse_judge_verdict, parse_time_query,
@@ -44,7 +45,7 @@ from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text
 
-PLUGIN_VERSION = "0.2.13"
+PLUGIN_VERSION = "0.2.14"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -154,6 +155,8 @@ _CONFIG_KEYS = (
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "history_rounds", "max_msg_tokens",
     "group_reply_max_chars", "group_reply_detail_chars",
+    "pool_trigger_tokens", "pool_max_wait_min", "pool_max_msgs",
+    "memory_prompt_budget",
     "vision_enabled", "vision_budget", "vision_model",
     "proactive_friends", "proactive_start", "proactive_end",
     "proactive_gap_hours", "proactive_per_day", "proactive_no_reply_limit",
@@ -180,6 +183,8 @@ class QQMindPlugin(star.Star):
         self.sessions: dict[tuple[int, int], MonitorSession] = {}
         self.privates: dict[int, PrivateSession] = {}
         self.memories: dict[int, GroupMemory] = {}
+        self._pools: dict[int, CandidatePool] = {}
+        self._flushing: dict[int, bool] = {}
         self.group_buffer = GroupBuffer(
             max_len=int(self._cfg("group_buffer_size", 60)))
         self.rate_limiter = RateLimiter(int(self._cfg("reply_rate_per_min", 6)))
@@ -243,6 +248,100 @@ class QQMindPlugin(star.Star):
             self.memories[gid] = gm
         return gm
 
+    def _pool(self, gid: int) -> CandidatePool:
+        """群候选池工厂（v0.2.14）：原文攒批，池满才压缩。"""
+        gid = int(gid)
+        p = self._pools.get(gid)
+        if p is None:
+            p = CandidatePool(
+                self._abs_dir("pool_dir", "qqmind_pool"), gid,
+                trigger_tokens=int(self._cfg("pool_trigger_tokens", 6000)),
+                max_wait_min=float(self._cfg("pool_max_wait_min", 180)),
+                max_msgs=int(self._cfg("pool_max_msgs", 3000)))
+            self._pools[gid] = p
+        return p
+
+    async def _flush_pool(self, gid: int) -> None:
+        """候选池攒满 → 一次模型调用拆成多篇话题日记；失败原样放回。"""
+        pool = self._pool(gid)
+        if not pool.msgs or self._flushing.get(gid):
+            return
+        self._flushing[gid] = True
+        try:
+            batch = pool.take_all()
+            pool.save()
+            provider = self.context.get_using_provider()
+            if provider is None:
+                pool.put_back(batch)
+                pool.save()
+                return
+            est, entries, resp = await self._group_mem(gid).compress_pool_call(
+                provider, batch)
+            if est <= 0 or not entries:
+                pool.put_back(batch)     # 失败重试：下轮触发再试
+                pool.save()
+                return
+            self._real_usage(resp, "compress")
+            n = self._group_mem(gid).compress_pool_batch(batch, entries)
+            # 原文归档（v0.2.14）：最近一批压缩的原文暂存日记库 meta，
+            # 供之后几天内的证据链回查；再往前就不留了（省空间）
+            try:
+                import json as _json
+                self._group_mem(gid).diary.set_meta(
+                    "evidence_archive",
+                    _json.dumps(batch, ensure_ascii=False)[:200000])
+            except Exception as e:
+                logger.debug(f"[qqmind] evidence archive failed: {e!r}")
+            self._budget().add(int(est), gid=int(gid))
+            logger.info(f"[qqmind] pool flush for {gid}: {len(batch)} msgs "
+                        f"-> {n} diary entries, est {est} tok")
+        finally:
+            self._flushing[gid] = False
+
+    def _evidence_context(self, gid: int, entry_id: int, window: int = 3,
+                          max_chars: int = 900) -> str:
+        """证据链回查（v0.2.14）：日记 evidence 消息 id → 原文 ±window 条。
+
+        原文来源优先级：候选池（还在池里）→ 已归档原文（evidence_archive
+        meta，压缩后保留的近期原文）。都取不到返回空串（日记自带原话选段兜底）。
+        """
+        gm = self._group_mem(gid)
+        ev_ids = gm.diary_evidence(entry_id)
+        if not ev_ids:
+            return ""
+        pool = self._pool(gid)
+        # 归档原文：最近一批压缩的原文暂存 meta（_flush_pool 落盘）
+        archived = []
+        try:
+            import json as _json
+            raw = gm.diary.get_meta("evidence_archive")
+            if raw:
+                archived = {int(m["id"]): m
+                            for m in _json.loads(raw)}
+        except Exception:
+            archived = {}
+        lines, used = [], 0
+        seen = set()
+        for mid in ev_ids:
+            ctx = pool.context_around(mid, window)
+            if not ctx and mid in archived:
+                # 归档里取 ±window（按 id 邻近）
+                ids = sorted(archived)
+                idx = ids.index(mid) if mid in ids else -1
+                if idx >= 0:
+                    ctx = [archived[i] for i in
+                           ids[max(0, idx - window):idx + window + 1]]
+            for m in ctx:
+                if m["id"] in seen:
+                    continue
+                seen.add(m["id"])
+                line = f"[{m['id']}] {m.get('nick') or '群友'}：{m.get('text', '')}"
+                if used + len(line) > max_chars:
+                    return "\n".join(lines)
+                used += len(line)
+                lines.append(line)
+        return "\n".join(lines)
+
     def _private(self, uid: int) -> PrivateSession:
         budget = int(self._cfg("private_budget_tokens", 10000))
         p = self.privates.get(uid)
@@ -302,6 +401,26 @@ class QQMindPlugin(star.Star):
         if n:
             self._budget().add(n, gid=gid)
         return n
+
+    def _real_usage(self, resp, kind: str) -> None:
+        """真实 API usage 分桶落账（v0.2.14）：kind=judge/compress/reply。
+
+        分三桶：in_hit（缓存命中）/ in_miss（未命中）/ out——对账对准
+        DeepSeek 官网账单（命中价差 50 倍，混算看不出钱烧在哪）。
+        存进 DailyBudget.usage_bucket，随 daily.json 落盘、跨日清零。
+        """
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return
+        b = self._budget()
+        buckets = getattr(b, "usage_bucket", None)
+        if buckets is None:
+            buckets = b.usage_bucket = {}
+        slot = buckets.setdefault(kind, {"in_hit": 0, "in_miss": 0, "out": 0})
+        slot["in_hit"] += int(getattr(usage, "input_cached", 0) or 0)
+        slot["in_miss"] += int(getattr(usage, "input_other", 0) or 0)
+        slot["out"] += int(getattr(usage, "output", 0) or 0)
+        b._save()
 
     def _maybe_quota_notice(self, gid: int, event: AstrMessageEvent) -> None:
         """额度耗尽时明说一次，每群每天最多 N 次。"""
@@ -542,6 +661,7 @@ class QQMindPlugin(star.Star):
         if not reply:
             return
         self._count_usage(prompt, reply, resp=out, gid=int(gid))
+        self._real_usage(out, "reply")
         reply = await self._recall_reply(reply, "group", uid, gid)
         if not reply:
             return
@@ -638,14 +758,16 @@ class QQMindPlugin(star.Star):
 
     def _group_system_prompt(self, gid: int, query: str = "",
                              uid: int = 0, nick: str = "") -> str:
+        """群聊 system prompt（v0.2.14 缓存分层）：
+
+        【稳定前缀】人设 + 发言风格 + 活人模板——长期不变，DeepSeek
+        前缀缓存对这段生效（命中价 ≈ 未命中的 1/50）。
+        【易变后缀】说话人锚定、好感度、召回背景、日记目录——每轮都变，
+        放在最后，改动不影响前缀缓存。
+        记忆注入总量受 _MEMORY_BUDGET_TOKENS 硬顶，超出按优先级裁。
+        """
+        # —— 稳定前缀 ——
         parts = []
-        # 说话人锚定（v0.2.11）：模型靠这个行知道"现在在跟谁说话"——
-        # 群名片随便改，QQ 号才是唯一身份；好感度/备注/日记画像都按它挂。
-        if uid:
-            who = f"{nick}（QQ:{uid}）" if nick else f"QQ:{uid}"
-            parts.append(f"【当前说话人】现在是 {who} 在跟你说话；"
-                         "群聊记录里每条开头的 昵称(QQ号) 就是发言者，"
-                         "同一 QQ 号就是同一个人，别被改名片骗了。")
         persona = self._persona_block()
         if persona:
             parts.append(persona)
@@ -661,32 +783,39 @@ class QQMindPlugin(star.Star):
                      "只有对方明确在求教程/讲题/求解释时才允许写长"
                      f"（上限 {self._cfg('group_reply_detail_chars', 240)} 字），"
                      "长也只写干货步骤或推导本身，写完就停，别总结别感叹。")
-        # 活人模式（v0.2.13，独立于人格/记忆的回复风格层）：
-        # 规则从本机 4 个群 3481 条真人消息提炼（画像见 docs/活人模式画像.md）。
-        # 默认开（_LIVE_MODE_DEFAULT 兜底，配置清空=关闭）。
-        live = str(self._cfg("persona_live_mode", _LIVE_MODE_DEFAULT)
-                   or "").strip()
+        # 活人模板（v0.2.13 提炼 / v0.2.14 抽成角色包微插件）：
+        # 优先当前激活包里的 live_mode.md，其次全局配置，最后代码默认。
+        live = self._live_mode_text()
         if live:
             parts.append("【像活人一样说话（硬性）】\n" + live)
+        stable = "\n".join(parts)
+
+        # —— 易变后缀（按预算从高到低优先级装填） ——
+        tail: list[tuple[int, str]] = []
+        if uid:
+            who = f"{nick}（QQ:{uid}）" if nick else f"QQ:{uid}"
+            tail.append((0, f"【当前说话人】现在是 {who} 在跟你说话；"
+                         "群聊记录里每条开头的 昵称(QQ号) 就是发言者，"
+                         "同一 QQ 号就是同一个人，别被改名片骗了。"))
         background = self._persona_background(query)
         if background:
-            parts.append(background)
+            tail.append((1, background))
         mode = self._memory_mode()
         if mode in ("layered", "precise"):
             headers = self._group_mem(gid).diary_headers(
-                int(self._cfg("diary_headers_in_prompt", 10)))
+                int(self._cfg("diary_headers_in_prompt", 8)))
             if headers:
-                parts.append("你有本群的日记（时间 标题，想细看就输出 "
-                             "<查群日记\"关键词或时间\">）：\n" + headers)
+                tail.append((2, "你有本群的日记（时间 标题，想细看就输出 "
+                                 "<查群日记\"关键词或时间\">）：\n" + headers))
             # 跨群共享记忆（v0.2.7，默认关）：其他群的日记标题也带进来，
             # 模型用 <查别群日记"群号:关键词"> 寻回——群间隐私默认隔离
             if self._cfg("share_memory_across_groups", False):
                 cross = self._cross_group_headers(gid)
                 if cross:
-                    parts.append(
-                        "你在其他群也有日记（想看就输出 "
-                        "<查别群日记\"群号:关键词或时间\">，群号必须带上）：\n"
-                        + cross)
+                    tail.append((3,
+                                 "你在其他群也有日记（想看就输出 "
+                                 "<查别群日记\"群号:关键词或时间\">，"
+                                 "群号必须带上）：\n" + cross))
         if mode == "precise":
             n_ctx = 10
         elif self._is_light():
@@ -696,8 +825,60 @@ class QQMindPlugin(star.Star):
         if n_ctx:
             ctx = "\n".join(self.group_buffer.recent(gid, n_ctx))
             if ctx:
-                parts.append(f"【最近的群聊（供理解语境，不必逐条回应）】\n{ctx}")
-        return "\n".join(parts)
+                tail.append((4, f"【最近的群聊（供理解语境，不必逐条回应）】"
+                                f"\n{ctx}"))
+
+        # 硬预算裁剪：优先级小的先丢（0 锚定 > 1 召回背景 > 2 日记目录
+        # > 3 跨群目录 > 4 群聊原文窗口）
+        budget = int(self._cfg("memory_prompt_budget", 700))
+        used = est_tokens(stable)
+        kept: list[str] = []
+        for prio, text in sorted(tail, key=lambda x: x[0]):
+            cost = est_tokens(text)
+            if used + cost > budget and prio >= 2:
+                continue   # 高优先级（锚定/召回）超预算也保留
+            used += cost
+            kept.append(text)
+        return stable + "\n" + "\n".join(kept)
+
+    _LIVE_CACHE: dict[str, tuple[float, str]] = {}
+
+    def _live_mode_text(self) -> str:
+        """活人模板三级来源（v0.2.14 角色包微插件）：
+
+        1. 当前激活角色包目录下 live_mode.md（随包插拔）
+        2. 全局配置 persona_live_mode
+        3. 代码默认 _LIVE_MODE_DEFAULT
+        配置显式设空串 = 强制关闭（跳过 1/3）。
+        """
+        if "persona_live_mode" in (self.plugin_config or {}):
+            configured = str(self.plugin_config.get("persona_live_mode")
+                             or "").strip()
+            if configured == "":
+                return ""          # 显式清空 = 关
+            if configured:
+                global_src = configured
+            else:
+                global_src = ""
+        else:
+            global_src = _LIVE_MODE_DEFAULT
+        pack = str(self._cfg("persona_pack", "") or "").strip()
+        if pack:
+            pdir = Path(self._abs_dir("persona_packs_dir",
+                                      "qqmind_persona_packs")) / pack
+            f = pdir / "live_mode.md"
+            try:
+                mtime = f.stat().st_mtime
+                cached = self._LIVE_CACHE.get(pack)
+                if cached and cached[0] == mtime:
+                    return cached[1]
+                text = f.read_text(encoding="utf-8").strip()
+                self._LIVE_CACHE[pack] = (mtime, text)
+                if text:
+                    return text    # 包模板优先
+            except OSError:
+                pass
+        return global_src
 
     def _cross_group_headers(self, gid: int, n_each: int = 5) -> str:
         """其他白名单群的日记标题（每群最多 n_each 条，标群号前缀）。"""
@@ -713,7 +894,11 @@ class QQMindPlugin(star.Star):
         return "\n".join(blocks)
 
     def _record_incoming(self, gid: int, uid: int, nick: str, text: str) -> None:
-        """全量/分层模式把每条群消息记进平铺窗口（轻量不记，精确记忆只记互动）。"""
+        """全量/分层模式把每条群消息记进平铺窗口（轻量不记，精确记忆只记互动）。
+
+        分层模式（v0.2.14）：窗口挤出的消息进候选池攒批，池满才压缩——
+        替代旧的"每挤一批就压一次"（3213 碎片日记的根因）。
+        """
         if not (text or "").strip() or self._is_light():
             return
         mode = self._memory_mode()
@@ -726,7 +911,14 @@ class QQMindPlugin(star.Star):
                  else int(self._cfg("group_shallow_messages", 20)))
         evicted = gm.take_flat_overflow(limit)
         if evicted and mode == "layered":
-            asyncio.create_task(self._compress_or_restore(gid, evicted))
+            pool = self._pool(gid)
+            now = time.time()
+            for m in evicted:
+                pool.add(m.get("ts") or now, m.get("uid") or 0,
+                         m.get("nick") or "", m.get("content") or "")
+            pool.save()
+            if pool.should_flush():
+                asyncio.create_task(self._flush_pool(gid))
         gm.save()
 
     def _persist_group(self, gid: int, uid: int,
@@ -750,7 +942,14 @@ class QQMindPlugin(star.Star):
                      else int(self._cfg("group_shallow_messages", 20)))
             evicted = gm.take_flat_overflow(limit)
             if evicted and mode == "layered":
-                asyncio.create_task(self._compress_or_restore(gid, evicted))
+                pool = self._pool(gid)
+                now = time.time()
+                for m in evicted:
+                    pool.add(m.get("ts") or now, m.get("uid") or 0,
+                             m.get("nick") or "", m.get("content") or "")
+                pool.save()
+                if pool.should_flush():
+                    asyncio.create_task(self._flush_pool(gid))
         gm.save()
 
     async def _compress_or_restore(self, gid: int, msgs: list[dict],
@@ -1122,6 +1321,7 @@ class QQMindPlugin(star.Star):
             logger.warning(f"[qqmind] judge error (fail-closed): {e!r}")
             return False, False
         self._count_usage(ask, out_text, resp=out, gid=int(gid))
+        self._real_usage(out, "judge")
         verdict = parse_judge_verdict(out_text)
         if verdict is None:
             # 模型输出不合规格：按失败计，走 fail-closed（宁漏接不插嘴）
@@ -1353,6 +1553,14 @@ class QQMindPlugin(star.Star):
                     detail = self._private(uid).diary.expand(eid)
                 else:
                     detail = self._group_mem(diary_gid).diary.expand(eid)
+                # 证据链（v0.2.14）：命中日记的 evidence 消息 id →
+                # 候选池原文 ±3 条一起给，概要之外的对话细节当场还原
+                raw_ctx = ""
+                if scope == "group":
+                    raw_ctx = self._evidence_context(diary_gid, eid)
+                    if raw_ctx:
+                        detail = (detail + "\n\n（当时的上下文原文：\n"
+                                  + raw_ctx + "）")
                 out2 = await provider.text_chat(
                     prompt=(f"（你刚才想查记忆：{query}）\n"
                             f"查询结果（概要）：\n{found}\n"
@@ -1441,6 +1649,7 @@ class QQMindPlugin(star.Star):
         self._count_usage(event.message_str or "", reply, resp=resp,
                           gid=(int(event.get_group_id() or 0)
                                if not event.is_private_chat() else 0))
+        self._real_usage(resp, "reply")
         reply = await self._resolve_recall(event, resp, reply)
         if not reply:
             return

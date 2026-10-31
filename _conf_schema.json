@@ -153,6 +153,24 @@
     "default": 240,
     "hint": "对方求详细时放宽到这个数，避免推导/步骤被腰斩；仍比私聊收紧"
   },
+  "pool_trigger_tokens": {
+    "description": "候选池攒够多少 token 触发一次批量压缩",
+    "type": "int",
+    "default": 6000,
+    "hint": "越大单批越大、压缩次数越少；6000 约合每天 4~5 批（活跃群）"
+  },
+  "pool_max_wait_min": {
+    "description": "候选池最老消息等待多久后强制压缩（分钟）",
+    "type": "int",
+    "default": 180,
+    "hint": "冷群兜底：3 小时没攒满也压一次"
+  },
+  "pool_max_msgs": {
+    "description": "候选池最大消息条数（超出丢最老）",
+    "type": "int",
+    "default": 3000,
+    "hint": "内存/磁盘保护上限，正常永远到不了"
+  },
   "vision_enabled": {
     "description": "图片识别（表情包/截图看懂后进记忆）",
     "type": "bool",
@@ -357,5 +375,11 @@
     "items": {
       "type": "string"
     }
+  },
+  "memory_prompt_budget": {
+    "description": "记忆注入硬预算（token，超出按优先级裁剪）",
+    "type": "int",
+    "default": 700,
+    "hint": "说话人锚定/召回背景永不裁；日记目录/跨群目录/原文窗口按此封顶"
   }
 }

@@ -18,7 +18,8 @@ from pathlib import Path
 
 from .core import est_tokens
 from .diary import DiaryStore
-from .private import PrivateSession, complete_text
+from .private import PrivateSession, complete_text, complete_text_resp
+from .pool import CandidatePool, BATCH_COMPRESS_PROMPT
 
 GROUP_COMPRESS_PROMPT = (
     "你是群聊记忆整理助手。把下面这段群聊压缩成一篇群日记，帮机器人长期记住这件事。\n"
@@ -182,6 +183,93 @@ class GroupMemory:
                        title=title, content=content)
         self.save()
         return tok + 200
+
+    # ---------- 候选池合批压缩（v0.2.14） ----------
+    @staticmethod
+    def parse_batch_output(out: str) -> list[dict]:
+        """解析合批压缩输出 JSON 数组（容错剥代码块围栏）。"""
+        t = (out or "").strip()
+        if t.startswith("```"):
+            t = t.strip("`").lstrip("json").strip()
+        try:
+            v = json.loads(t)
+        except Exception:
+            return []
+        if isinstance(v, dict):     # 容错：单个对象也收
+            v = [v]
+        if not isinstance(v, list):
+            return []
+        return [e for e in v if isinstance(e, dict)]
+
+    async def compress_pool_call(self, llm, pool_msgs: list[dict]) -> tuple[int, list[dict], object]:
+        """一次调用把整批原文拆成多篇话题日记。
+
+        返回 (est_tokens, entries, resp)；est=0 表示调用或解析失败。
+        """
+        lines = []
+        for m in pool_msgs:
+            who = "AI" if m.get("role") == "assistant" else \
+                  (m.get("nick") or "群友")
+            lines.append(f"[{m['id']}] {who}：{m.get('text', '')}")
+        ask = (f"当前时间 {time.strftime('%Y-%m-%d %H:%M')}。"
+               f"共 {len(pool_msgs)} 条消息。\n\n" + "\n".join(lines))
+        try:
+            out, resp = await complete_text_resp(
+                llm, BATCH_COMPRESS_PROMPT, ask,
+                max_tokens=4000, temperature=0.3)
+        except Exception:
+            return 0, []
+        entries = self.parse_batch_output(out)
+        if not entries:
+            return 0, []
+        est = sum(CandidatePool._est(m.get("text", "")) + 12
+                  for m in pool_msgs)
+        est += 4000 // 2
+        return est, entries, resp
+
+    def compress_pool_batch(self, pool_msgs: list[dict],
+                            entries: list[dict]) -> int:
+        """把模型拆好的多篇话题日记入库（evidence 记证据消息 id）。
+
+        pool_msgs: 本批原文（CandidatePool.take_all 的结果，含 id）；
+        entries: 解析出的 [{title,tags,summary,content,evidence}]。
+        返回入库篇数。
+        """
+        n = 0
+        id2ts = {m["id"]: m.get("ts") for m in pool_msgs}
+        for e in entries:
+            title = str(e.get("title") or "").strip()[:40]
+            summary = str(e.get("summary") or "").strip()
+            if not summary:
+                continue
+            tags = [str(t) for t in (e.get("tags") or [])][:8]
+            content = str(e.get("content") or "").strip()[:600]
+            ev = [int(x) for x in (e.get("evidence") or [])
+                  if str(x).isdigit()][:10]
+            ts = (id2ts.get(ev[0]) if ev else None) or \
+                 (pool_msgs[0].get("ts") if pool_msgs else time.time())
+            # evidence 存进 tags 前缀无法表达——放 meta：diary.add 无该列，
+            # 用约定格式存 tags 之外再存进 content 头部注释？不——
+            # DiaryStore.entries 有 grams/tags/content 列；evidence 用
+            # 独立 meta 表按日记 id 存（见 store_evidence）。
+            eid = self.diary.add(ts, tags, summary, 0,
+                                 title=title, content=content)
+            if ev:
+                self.diary.set_meta(f"evidence_{eid}", json.dumps(ev))
+            n += 1
+        self.save()
+        return n
+
+    def diary_evidence(self, entry_id: int) -> list[int]:
+        """某篇日记登记的证据消息 id 列表。"""
+        raw = self.diary.get_meta(f"evidence_{int(entry_id)}")
+        if not raw:
+            return []
+        try:
+            v = json.loads(raw)
+            return [int(x) for x in v if str(x).isdigit()][:10]
+        except Exception:
+            return []
 
     def diary_headers(self, n: int = 10) -> str:
         return self.diary.headers_for_prompt(n)

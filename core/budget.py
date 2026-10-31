@@ -21,6 +21,8 @@ class DailyBudget:
         self.notices: dict[int, int] = {}
         # 分群子账（v0.2.7）：gid -> 该群当日 token；0/None key = 非群聊（私聊/后台）
         self.per_group: dict[int, int] = {}
+        # 真实 API usage 分桶（v0.2.14）：kind -> {in_hit, in_miss, out}
+        self.usage_bucket: dict[str, dict] = {}
         self._load()
 
     # ---------- 落盘 ----------
@@ -35,9 +37,11 @@ class DailyBudget:
             self.notices = {int(k): int(v) for k, v in (d.get("notices") or {}).items()}
             self.per_group = {int(k): int(v)
                               for k, v in (d.get("per_group") or {}).items()}
+            self.usage_bucket = (d.get("usage_bucket") or {})
         except Exception:
             self.day, self.used, self.notices = time.strftime("%Y-%m-%d"), 0, {}
             self.per_group = {}
+            self.usage_bucket = {}
         self._roll()
 
     def _save(self) -> None:
@@ -49,7 +53,9 @@ class DailyBudget:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"day": self.day, "used": self.used,
                            "notices": self.notices,
-                           "per_group": self.per_group}, f, ensure_ascii=False)
+                           "per_group": self.per_group,
+                           "usage_bucket": self.usage_bucket},
+                          f, ensure_ascii=False)
             os.replace(tmp, self.path)
         except OSError as e:
             # 路径被目录占位 / 磁盘只读等：账本写失败不能拖垮消息处理，
@@ -65,6 +71,7 @@ class DailyBudget:
             self.used = 0
             self.notices = {}
             self.per_group = {}
+            self.usage_bucket = {}
             self._save()
 
     # ---------- 账本 ----------

@@ -31,14 +31,28 @@ COMPRESS_PROMPT = (
 async def complete_text(llm, system: str, user: str,
                         max_tokens: int = 600, temperature: float = 0.3) -> str:
     """统一 LLM 调用：测试桩用 .complete，AstrBot Provider 用 .text_chat。"""
+    out = await complete_text_resp(llm, system, user,
+                                   max_tokens=max_tokens,
+                                   temperature=temperature)
+    return out[0]
+
+
+async def complete_text_resp(llm, system: str, user: str,
+                             max_tokens: int = 600,
+                             temperature: float = 0.3) -> tuple[str, object]:
+    """同 complete_text，但连 LLMResponse 一起返回（真实 usage 分桶记账用）。
+
+    测试桩 .complete 路径没有 usage 对象时第二项为 None。
+    """
     if hasattr(llm, "complete"):
-        return await llm.complete(
+        text = await llm.complete(
             [{"role": "system", "content": system},
              {"role": "user", "content": user}],
             max_tokens=max_tokens, temperature=temperature)
+        return text, None
     out = await llm.text_chat(prompt=user, session_id=None,
                               system_prompt=system, contexts=[], image_urls=[])
-    return out.completion_text or ""
+    return out.completion_text or "", out
 
 
 class PrivateSession:

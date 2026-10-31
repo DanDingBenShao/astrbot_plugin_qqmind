@@ -171,6 +171,13 @@ class DiaryStore:
         """画像 JSON 存日记库 meta 表（与该用户日记同库同生命周期）。"""
         self._meta_set("profile", json.dumps(profile, ensure_ascii=False))
 
+    def set_meta(self, k: str, v: str) -> None:
+        """公开 meta 写入口（证据链 evidence 等结构化扩展，v0.2.14）。"""
+        self._meta_set(k, v)
+
+    def get_meta(self, k: str) -> str | None:
+        return self._meta_get(k)
+
     def load_profile(self) -> dict:
         try:
             d = json.loads(self._meta_get("profile") or "{}")

@@ -218,10 +218,13 @@ class GroupMemory:
                 llm, BATCH_COMPRESS_PROMPT, ask,
                 max_tokens=4000, temperature=0.3)
         except Exception:
-            return 0, []
+            # v0.2.15 审查修：调用方按 3 元组解包——少返回一项会让整个
+            # flush 任务 ValueError 挂掉，整批消息搁浅在 pending 里，
+            # 下批成功时 pending 被覆盖、上一批永久丢失
+            return 0, [], None
         entries = self.parse_batch_output(out)
         if not entries:
-            return 0, []
+            return 0, [], None
         est = sum(CandidatePool._est(m.get("text", "")) + 12
                   for m in pool_msgs)
         est += 4000 // 2

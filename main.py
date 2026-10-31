@@ -43,9 +43,9 @@ from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
-from .core.private import complete_text
+from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.2.15"
+PLUGIN_VERSION = "0.2.16"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -174,6 +174,18 @@ def _short_title(summary: str, limit: int = 18) -> str:
     return s[:limit] + ("…" if len(s) > limit else "")
 
 
+def _strip_own_prefix(nick: str, content: str) -> str:
+    """平铺窗口存的 content 已带「nick：」前缀，入候选池时剥掉——
+    池压缩时会重新拼「nick：text」，不剥就变成「甲：甲：内容」双前缀。"""
+    c = (content or "").strip()
+    n = (nick or "").strip()
+    if n and c.startswith(f"{n}："):
+        c = c[len(n) + 1:].lstrip()
+    elif n and c.startswith(f"{n}:"):
+        c = c[len(n) + 1:].lstrip()
+    return c
+
+
 class QQMindPlugin(star.Star):
     """群聊记忆体：判读门 + 深层记忆 + 私聊日记。"""
 
@@ -204,6 +216,7 @@ class QQMindPlugin(star.Star):
         self._proactive = proactive.ProactiveState(
             int(self._cfg("proactive_per_day", 1)))
         self._proactive_task: asyncio.Task | None = None
+        self._pool_sweep_task: asyncio.Task | None = None
         self._STATS_G: dict[int, dict] = {}   # 分群计数子账（内存态，与 _STATS 同口径）
         self._affection = AffectionStore(
             self._private,
@@ -281,6 +294,8 @@ class QQMindPlugin(star.Star):
                 pool.put_back(batch)     # 失败重试：下轮触发再试
                 pool.save()
                 pool.mark_failed()       # 冷却 5 分钟，别每条消息重试一次
+                logger.warning(f"[qqmind] pool flush failed for {gid}: "
+                               f"{len(batch)} msgs put back, cooldown 5min")
                 return
             self._real_usage(resp, "compress")
             n = self._group_mem(gid).compress_pool_batch(batch, entries)
@@ -293,6 +308,8 @@ class QQMindPlugin(star.Star):
             except Exception as e:
                 logger.debug(f"[qqmind] evidence archive failed: {e!r}")
             pool.confirm_taken()   # 整批正式交割，删 pending
+            # add 在 confirm 之后：这前一段崩溃了 pending 兜底还在；
+            # bucket 随 add 的落盘一起写盘
             self._budget().add(int(est), gid=int(gid))
             logger.info(f"[qqmind] pool flush for {gid}: {len(batch)} msgs "
                         f"-> {n} diary entries, est {est} tok")
@@ -354,6 +371,30 @@ class QQMindPlugin(star.Star):
         else:
             p.budget = budget      # 控制台改预算热生效
         return p
+
+    def _ensure_pool_sweep(self) -> None:
+        """候选池巡检循环（v0.2.15 审查修）：should_flush 只在「下一条消息
+        被挤出」时被顺带检查——安静群攒了消息但迟迟没人触发，max_wait
+        形同虚设。每 5 分钟扫一遍所有有货的池子。"""
+        if self._pool_sweep_task and not self._pool_sweep_task.done():
+            return
+        self._pool_sweep_task = asyncio.create_task(self._pool_sweep_loop())
+        logger.info("[qqmind] pool sweep loop started")
+
+    async def _pool_sweep_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(300)
+                now = time.time()
+                for gid, pool in list(self._pools.items()):
+                    if pool.msgs and pool.should_flush(now):
+                        try:
+                            await self._flush_pool(gid)
+                        except Exception as e:     # noqa: BLE001
+                            logger.warning(f"[qqmind] pool sweep flush "
+                                           f"{gid} failed: {e!r}")
+        except asyncio.CancelledError:
+            pass
 
     def _ensure_proactive_loop(self) -> None:
         """守护循环懒启动（首个私聊会话建立时）；
@@ -662,8 +703,9 @@ class QQMindPlugin(star.Star):
             return
         if not reply:
             return
-        self._count_usage(prompt, reply, resp=out, gid=int(gid))
+        # real 在 count 之前：count_usage/add 内部落盘，把 bucket 一并写盘
         self._real_usage(out, "reply")
+        self._count_usage(prompt, reply, resp=out, gid=int(gid))
         reply = await self._recall_reply(reply, "group", uid, gid)
         if not reply:
             return
@@ -919,10 +961,12 @@ class QQMindPlugin(star.Star):
             now = time.time()
             for m in evicted:
                 pool.add(m.get("ts") or now, m.get("uid") or 0,
-                         m.get("nick") or "", m.get("content") or "")
-            pool.save()
-            if pool.should_flush():
-                asyncio.create_task(self._flush_pool(gid))
+                         m.get("nick") or "", _strip_own_prefix(
+                             m.get("nick") or "", m.get("content") or ""))
+                pool.save()
+                if pool.should_flush():
+                    asyncio.create_task(self._flush_pool(gid))
+                self._ensure_pool_sweep()
         gm.save()
 
     def _persist_group(self, gid: int, uid: int,
@@ -950,10 +994,12 @@ class QQMindPlugin(star.Star):
                 now = time.time()
                 for m in evicted:
                     pool.add(m.get("ts") or now, m.get("uid") or 0,
-                             m.get("nick") or "", m.get("content") or "")
-                pool.save()
-                if pool.should_flush():
-                    asyncio.create_task(self._flush_pool(gid))
+                             m.get("nick") or "", _strip_own_prefix(
+                                 m.get("nick") or "", m.get("content") or ""))
+                    pool.save()
+                    if pool.should_flush():
+                        asyncio.create_task(self._flush_pool(gid))
+                    self._ensure_pool_sweep()
         gm.save()
 
     async def _compress_or_restore(self, gid: int, msgs: list[dict],
@@ -1030,7 +1076,7 @@ class QQMindPlugin(star.Star):
             return
         sys_prompt = self._group_system_prompt(gid, "", uid=uid, nick=nick)
         try:
-            reaction = await complete_text(
+            reaction, resp = await complete_text_resp(
                 provider,
                 sys_prompt or "你是群里的 AI 成员",
                 self._POKE_REACT_PROMPT.format(stance=stance),
@@ -1038,6 +1084,11 @@ class QQMindPlugin(star.Star):
         except Exception as e:
             logger.warning(f"[qqmind] poke reaction llm failed: {e!r}")
             return
+        # 戳一戳也走真实分桶账（v0.2.15 审查修）：system 稳定前缀这一笔
+        # 不小（人设+活人模板），只记 est 会漏掉约 1000 tok/次的输入侧
+        self._real_usage(resp, "reply")
+        self._count_usage(sys_prompt, self._POKE_REACT_PROMPT, reaction,
+                          gid=int(gid))
         reaction = split_bubbles(
             (reaction or "").strip(),
             max_total_chars=int(self._cfg("group_reply_max_chars", 80)))
@@ -1055,7 +1106,6 @@ class QQMindPlugin(star.Star):
         self._stat("replied", gid)
         if self._cfg("affinity_enabled", False):
             self._affection.add(uid, 1)
-        self._count_usage("（戳一戳）", body)
         # 进日记：轻描淡写一条（不为戳一戳跑压缩模型，省钱）
         if not self._is_light() and self._memory_mode() != "precise":
             gm = self._group_mem(gid)
@@ -1121,6 +1171,26 @@ class QQMindPlugin(star.Star):
             return
         nick = (event.get_sender_name() or "").strip() or str(uid)
         text = (event.message_str or "").strip()
+        # 通知类事件拦截（v0.2.15 审查修）：aiocqhttp 把戳别人/进退群/撤回等
+        # notice 也当 GROUP_MESSAGE 派发（message_str 恒空、无引用无图）——
+        # 不拦会每条通知写一行「某人：[图片]」假消息污染群缓冲与判读语境。
+        # 非戳自己的 Poke（互戳）同样静默。判据两层：OneBot post_type=notice
+        # 优先（真事件），fallback 看无文本无引用无图（假事件/其他适配器）。
+        raw = getattr(event.message_obj, "raw_message", None)
+        is_notice = False
+        try:
+            is_notice = (getattr(raw, "post_type", None)
+                         or (raw.get("post_type") if hasattr(raw, "get") else None)
+                         or "") == "notice"
+        except Exception:
+            is_notice = False
+        if is_notice or (
+                not text
+                and not _quote_reply_prefix(event.get_messages() or [])
+                and not any(type(s).__name__ == "Image"
+                            for s in (event.get_messages() or []))):
+            event.should_call_llm(True)
+            return
         preset = normalize_preset(self._cfg("group_preset", "light"))
         keywords = (self._cfg("wake_keywords", [])
                     if keyword_wake_enabled(preset) else [])
@@ -1292,9 +1362,10 @@ class QQMindPlugin(star.Star):
         k = len(batch) if batch else 1
         ctx_all = self.group_buffer.recent(gid, 7 + k)
         ctx_lines = ctx_all[:-k][-7:] if len(ctx_all) >= k else []
-        # 待判消息与缓冲同格式（nick(uid)：内容），判读门认得出是谁在说
-        pending = ("\n".join(f"{m['nick']}({m['uid']}): {m['text']}"
-                             for m in batch)
+        # 待判消息与缓冲同格式（nick(uid)：内容）。注意 on_message 入队时
+        # nick 已含 (uid)，这里不再包一层（v0.2.15 审查修：否则变成
+        # 张三(111)(111)，判读门认不出同一个人）
+        pending = ("\n".join(f"{m['nick']}: {m['text']}" for m in batch)
                    if batch else f"{nick}：{text}")
         question = ("以上这些消息是在对AI助手说话吗？若在，需要AI深度思考吗？"
                     if batch else
@@ -1324,8 +1395,9 @@ class QQMindPlugin(star.Star):
                                f"degraded to light until next @")
             logger.warning(f"[qqmind] judge error (fail-closed): {e!r}")
             return False, False
-        self._count_usage(ask, out_text, resp=out, gid=int(gid))
+        # real 在 count 之前（bucket 随 count 的落盘一起写盘）
         self._real_usage(out, "judge")
+        self._count_usage(ask, out_text, resp=out, gid=int(gid))
         verdict = parse_judge_verdict(out_text)
         if verdict is None:
             # 模型输出不合规格：按失败计，走 fail-closed（宁漏接不插嘴）
@@ -1650,10 +1722,10 @@ class QQMindPlugin(star.Star):
         reply = (getattr(resp, "completion_text", "") or "").strip()
         if not uid or not reply:
             return
+        self._real_usage(resp, "reply")
         self._count_usage(event.message_str or "", reply, resp=resp,
                           gid=(int(event.get_group_id() or 0)
                                if not event.is_private_chat() else 0))
-        self._real_usage(resp, "reply")
         reply = await self._resolve_recall(event, resp, reply)
         if not reply:
             return
@@ -1798,6 +1870,9 @@ class QQMindPlugin(star.Star):
         if self._proactive_task and not self._proactive_task.done():
             self._proactive_task.cancel()
             self._proactive_task = None
+        if self._pool_sweep_task and not self._pool_sweep_task.done():
+            self._pool_sweep_task.cancel()
+            self._pool_sweep_task = None
         for rt in self._runtime.values():
             for key in ("batch_task", "random_task"):
                 t = rt.get(key)

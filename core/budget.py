@@ -115,4 +115,6 @@ class DailyBudget:
         self._roll()
         return {"day": self.day, "used": self.used, "limit": self.limit,
                 "remaining": self.remaining(),
-                "per_group": dict(self.per_group)}
+                "per_group": dict(self.per_group),
+                "usage_bucket": {k: dict(v)
+                                 for k, v in self.usage_bucket.items()}}

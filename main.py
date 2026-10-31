@@ -44,7 +44,7 @@ from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text
 
-PLUGIN_VERSION = "0.2.12"
+PLUGIN_VERSION = "0.2.13"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -65,6 +65,21 @@ _DETAIL_QUERY_RE = re.compile(
     r"详解|详细|细说|展开说|讲讲|讲一下|解释一下|原理|教程|步骤|推导|"
     r"帮我(看看|算|推|查|分析)|求证|对不对|对吗|哪里(错|出错了)|(错|问题)在(哪|哪里)|"
     r"解(一)?下|这道题|算式|证明|分析一下|[-+×÷=^]|\d+\s*[-+×÷^]\s*\d")
+
+# 活人模式默认规则（v0.2.13）：从 4 群 3481 条真人消息画像提炼，
+# 提炼依据与数据详见 docs/活人模式画像.md；配置 persona_live_mode 清空即关闭。
+_LIVE_MODE_DEFAULT = (
+    "1. 短：一句话够就别两句，能 15 字说完别写 30 字。\n"
+    "2. 裸收尾：默认句尾不带标点，句号只在郑重时用；感叹号基本不用。\n"
+    "3. 想说的多就拆成两三条短消息连发（像真人边想边打），别一次塞满一段。\n"
+    "4. 接话直接回应上一条，用「不是/什么/怎么/可以」这类口语词推进，"
+    "禁止书面衔接词（关于/总的来说/首先其次）。\n"
+    "5. 情绪用词不用标点堆：惊讶「？？」「啊」，嘲笑「乐」，无奈「绷」，"
+    "认可「6」，玩梗「草」；波浪号少用。\n"
+    "6. 不每句自称名字/人设称谓；人设只在被问或被调侃时自然带出。\n"
+    "7. 允许省主语、话说一半、无伤大雅的错别字——活人信号；"
+    "禁止语法完美的长难句。\n"
+    "8. 别人开玩笑就顺着接一句短的，别解释笑点；被戳到雷点才正经。")
 
 
 def _is_detail_query(query: str) -> bool:
@@ -125,6 +140,7 @@ def _is_poke_self(segments, self_id: str) -> bool:
 # 控制台可读写的配置键（与 _conf_schema.json 对齐）
 _CONFIG_KEYS = (
     "persona_text", "persona_shallow", "persona_deep", "persona_pack",
+    "persona_live_mode",
     "persona_packs_dir", "persona_headers_in_prompt", "persona_recall_top",
     "private_budget_tokens", "diary_headers_in_prompt", "diaries_dir",
     "group_preset", "wake_keywords", "group_buffer_size",
@@ -645,6 +661,13 @@ class QQMindPlugin(star.Star):
                      "只有对方明确在求教程/讲题/求解释时才允许写长"
                      f"（上限 {self._cfg('group_reply_detail_chars', 240)} 字），"
                      "长也只写干货步骤或推导本身，写完就停，别总结别感叹。")
+        # 活人模式（v0.2.13，独立于人格/记忆的回复风格层）：
+        # 规则从本机 4 个群 3481 条真人消息提炼（画像见 docs/活人模式画像.md）。
+        # 默认开（_LIVE_MODE_DEFAULT 兜底，配置清空=关闭）。
+        live = str(self._cfg("persona_live_mode", _LIVE_MODE_DEFAULT)
+                   or "").strip()
+        if live:
+            parts.append("【像活人一样说话（硬性）】\n" + live)
         background = self._persona_background(query)
         if background:
             parts.append(background)

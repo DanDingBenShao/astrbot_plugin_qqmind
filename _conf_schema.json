@@ -153,17 +153,11 @@
     "default": 240,
     "hint": "对方求详细时放宽到这个数，避免推导/步骤被腰斩；仍比私聊收紧"
   },
-  "pool_trigger_tokens": {
-    "description": "候选池攒够多少 token 触发一次批量压缩",
+  "pool_trigger_msgs": {
+    "description": "候选池攒够多少条消息压一次（所有群共用一个池）",
     "type": "int",
-    "default": 6000,
-    "hint": "越大单批越大、压缩次数越少；6000 约合每天 4~5 批（活跃群）"
-  },
-  "pool_max_wait_min": {
-    "description": "候选池最老消息等待多久后强制压缩（分钟）",
-    "type": "int",
-    "default": 180,
-    "hint": "冷群兜底：3 小时没攒满也压一次"
+    "default": 1000,
+    "hint": "老板定案：1000 条左右压一次；每天凌晨 04:30 残余兜底压一次"
   },
   "pool_max_msgs": {
     "description": "候选池最大消息条数（超出丢最老）",
@@ -224,12 +218,6 @@
     "description": "连续几次没回应后冷却该用户 7 天",
     "type": "int",
     "default": 3
-  },
-  "share_memory_across_groups": {
-    "description": "跨群共享记忆（默认关：群间记忆互相隔离）",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后 A 群的 AI 能看到 B 群（白名单内）的日记标题并按需寻回；注意群间隐私"
   },
   "affinity_enabled": {
     "description": "好感度系统（按人记分+备注+作息，主动聊天按好感度触发）",

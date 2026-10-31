@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -75,9 +76,13 @@ class DiaryStore:
 
     _OPEN: list["DiaryStore"] = []
 
-    def __init__(self, diaries_dir: str | Path, uid: int | str):
-        self.uid = int(uid)
-        self.path = Path(diaries_dir) / f"{self.uid}.db"
+    def __init__(self, diaries_dir: str | Path, uid: int | str,
+                 *, name: str | None = None):
+        """name 非空 → 公共库（文件名用 name，如 group_public.db，uid=0）。
+        v0.3.0 公共群记忆：所有群共用一个库，entries.gid 记来源群。"""
+        self.uid = int(uid) if not name else 0
+        self.name = name or str(self.uid)
+        self.path = Path(diaries_dir) / f"{self.name}.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.path))
         self._db.row_factory = sqlite3.Row
@@ -92,7 +97,8 @@ class DiaryStore:
             tags    TEXT NOT NULL DEFAULT '[]',
             summary TEXT NOT NULL,
             content TEXT NOT NULL DEFAULT '',
-            tokens  INTEGER NOT NULL DEFAULT 0
+            tokens  INTEGER NOT NULL DEFAULT 0,
+            gid     INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_entries_ts ON entries(ts);
         CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
@@ -147,6 +153,13 @@ class DiaryStore:
             # v0.2.5 三层日记：content 列存原文选段（第三层），旧库默认空=没有全文
             self._db.execute(
                 "ALTER TABLE entries ADD COLUMN content TEXT NOT NULL DEFAULT ''")
+        if "gid" not in cols:
+            # v0.3.0 公共群记忆：gid 记来源群，旧库补列（私聊库全 0，无影响）
+            # 注意 cols 是建表前读的：新建库由 _SCHEMA 直接带 gid，别再 ALTER
+            cols_now = {r[1] for r in self._db.execute("PRAGMA table_info(entries)")}
+            if "gid" not in cols_now:
+                self._db.execute(
+                    "ALTER TABLE entries ADD COLUMN gid INTEGER NOT NULL DEFAULT 0")
         need_rebuild = (rebuilding or upgrading_title
                         or self._meta_get("fts_ver") != self._FTS_VER)
         if need_rebuild:
@@ -226,9 +239,61 @@ class DiaryStore:
         for inst in list(cls._OPEN):
             inst.close()
 
+    @staticmethod
+    def migrate_group_dbs(diaries_dir: str | Path, target: "DiaryStore") -> int:
+        """v0.3.0 公共群记忆迁移：把 <gid>.db 的群日记并入公共库。
+
+        幂等：meta['migrated_gid_dbs'] 记录已并的库；并完改名 .migrated 备份。
+        返回并入篇数。evidence 元数据不迁（旧证据链本就只服务最近一批）。
+        """
+        ddir = Path(diaries_dir)
+        done = set((target.get_meta("migrated_gid_dbs") or "").split(","))
+        done.discard("")
+        merged = 0
+        moved: list[str] = []
+        for f in sorted(ddir.glob("*.db")):
+            gid_s = f.stem
+            if not gid_s.isdigit():
+                continue
+            if gid_s in done:
+                # 上次已并入但改名被文件锁挡住：每次启动重试清理（数据不会重复）
+                try:
+                    os.replace(f, ddir / f"{gid_s}.db.migrated")
+                except OSError:
+                    pass
+                continue
+            try:
+                src = sqlite3.connect(str(f))
+                src.row_factory = sqlite3.Row
+                rows = src.execute("SELECT * FROM entries ORDER BY id").fetchall()
+                src.close()
+            except sqlite3.Error:
+                continue
+            for r in rows:
+                cols = r.keys()
+                target.add(
+                    r["ts"], json.loads(r["tags"] or "[]"), r["summary"],
+                    tokens=int(r["tokens"] or 0),
+                    title=(r["title"] if "title" in cols else "") or "",
+                    content=(r["content"] if "content" in cols else "") or "",
+                    gid=int(gid_s))
+                merged += 1
+            moved.append(gid_s)
+        if moved:
+            done.update(moved)
+            target.set_meta("migrated_gid_dbs", ",".join(sorted(done)))
+            for gid_s in moved:
+                f = ddir / f"{gid_s}.db"
+                try:
+                    os.replace(f, ddir / f"{gid_s}.db.migrated")
+                except OSError:
+                    pass
+        return merged
+
     # ---------- 写 ----------
     def add(self, ts: float, tags: list[str], summary: str,
-            tokens: int = 0, title: str = "", content: str = "") -> int:
+            tokens: int = 0, title: str = "", content: str = "",
+            gid: int = 0) -> int:
         tags = [t.strip() for t in (tags or []) if t and t.strip()][:8]
         title = (title or "").strip()[:40]
         tags_json = json.dumps(tags, ensure_ascii=False)
@@ -236,11 +301,11 @@ class DiaryStore:
         # grams 是 entries 的真实列（external content 的 fts 从这里取），
         # INSERT 触发器自动带进 fts，无需手动同步
         cur = self._db.execute(
-            "INSERT INTO entries(ts, title, tags, summary, tokens, grams, content) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO entries(ts, title, tags, summary, tokens, grams, "
+            "content, gid) VALUES (?,?,?,?,?,?,?,?)",
             (float(ts), title, tags_json,
              (summary or "").strip(), int(tokens), grams,
-             (content or "").strip()))
+             (content or "").strip(), int(gid or 0)))
         self._db.commit()
         return cur.lastrowid
 

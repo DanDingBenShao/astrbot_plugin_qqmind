@@ -19,7 +19,45 @@ from pathlib import Path
 from .core import est_tokens
 from .diary import DiaryStore
 from .private import PrivateSession, complete_text, complete_text_resp
-from .pool import CandidatePool, BATCH_COMPRESS_PROMPT
+from .pool import BATCH_COMPRESS_PROMPT, _est as _pool_est
+
+
+def _salvage_json_array(text: str) -> list:
+    """从被截断的 JSON 数组里捞回已完整的对象（v0.3.0 截断容错）。
+
+    扫描字符级括号配平（忽略字符串内的括号），收集每个顶层 {...} 的
+    完整文本，逐个 json.loads；坏一个丢一个，不连坐。
+    """
+    objs: list = []
+    depth = 0
+    in_str = False
+    esc = False
+    start = -1
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        objs.append(json.loads(text[start:i + 1]))
+                    except Exception:
+                        pass
+                    start = -1
+    return objs
 
 GROUP_COMPRESS_PROMPT = (
     "你是群聊记忆整理助手。把下面这段群聊压缩成一篇群日记，帮机器人长期记住这件事。\n"
@@ -33,18 +71,24 @@ GROUP_COMPRESS_PROMPT = (
 
 
 class GroupMemory:
-    """单个群的记忆：平铺/浅层窗口 + 每人精确记忆线 + 群日记库。"""
+    """单个群的记忆：平铺/浅层窗口 + 每人精确记忆线 + 群日记库。
+
+    v0.3.0 公共群记忆：多个 GroupMemory 可共享同一个公共 DiaryStore
+    （由调用方传入 diary），日记不再是某群私有。
+    """
 
     def __init__(self, store_dir, gid: int, diary_dir=None, *,
                  flat_limit: int = 60, shallow_limit: int = 20,
-                 precise_budget: int = 4000):
+                 precise_budget: int = 4000, diary: DiaryStore | None = None):
         self.gid = int(gid)
         self.path = Path(store_dir) / f"{self.gid}.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.flat_limit = max(2, int(flat_limit))
         self.shallow_limit = max(2, int(shallow_limit))
         self.precise_budget = max(200, int(precise_budget))
-        self.diary = DiaryStore(diary_dir or store_dir, self.gid)
+        self.diary = diary if diary is not None else \
+            DiaryStore(diary_dir or store_dir, self.gid)
+        self._owns_diary = diary is None    # 共享库由插件统一关
         self.flat: list[dict] = []
         self.precise: dict[int, list[dict]] = {}
         self._load()
@@ -75,7 +119,8 @@ class GroupMemory:
                 f"[qqmind] group memory save failed for {self.gid}: {e!r}")
 
     def close(self) -> None:
-        self.diary.close()
+        if getattr(self, "_owns_diary", True):
+            self.diary.close()
 
     # ---------- 平铺 / 浅层 ----------
     @staticmethod
@@ -180,43 +225,59 @@ class GroupMemory:
             tags = list(dict.fromkeys([str(t) for t in tags_extra] + tags))[:8]
         tok = sum(est_tokens(m.get("content", "")) for m in msgs)
         self.diary.add(msgs[0].get("ts") or time.time(), tags, summary, tok,
-                       title=title, content=content)
+                       title=title, content=content, gid=self.gid)
         self.save()
         return tok + 200
 
-    # ---------- 候选池合批压缩（v0.2.14） ----------
+    # ---------- 候选池合批压缩（v0.3.0 公共池） ----------
     @staticmethod
     def parse_batch_output(out: str) -> list[dict]:
-        """解析合批压缩输出 JSON 数组（容错剥代码块围栏）。"""
+        """解析合批压缩输出 JSON 数组（容错剥围栏 + 截断 salvage）。
+
+        截断 salvage（v0.3.0）：模型输出超预算被截断时，扫到最后一个完整
+        对象为止，捞回已完整的篇目——剩下一刀切整批失败会双倍烧钱。
+        """
         t = (out or "").strip()
         if t.startswith("```"):
             t = t.strip("`").lstrip("json").strip()
         try:
             v = json.loads(t)
         except Exception:
-            return []
+            v = _salvage_json_array(t)
         if isinstance(v, dict):     # 容错：单个对象也收
             v = [v]
         if not isinstance(v, list):
             return []
         return [e for e in v if isinstance(e, dict)]
 
-    async def compress_pool_call(self, llm, pool_msgs: list[dict]) -> tuple[int, list[dict], object]:
+    async def compress_pool_call(self, llm, pool_msgs: list[dict],
+                                 prelude: list[dict] | None = None
+                                 ) -> tuple[int, list[dict], object]:
         """一次调用把整批原文拆成多篇话题日记。
 
-        返回 (est_tokens, entries, resp)；est=0 表示调用或解析失败。
+        prelude：上一批结尾 5 条原文（只供理解，不参与入库）——跨批话题
+        不断头。返回 (est_tokens, entries, resp)；est=0 表示调用或解析失败。
         """
         lines = []
         for m in pool_msgs:
             who = "AI" if m.get("role") == "assistant" else \
                   (m.get("nick") or "群友")
-            lines.append(f"[{m['id']}] {who}：{m.get('text', '')}")
+            gid = m.get("gid") or 0
+            tag = f"群{gid} " if gid else ""
+            lines.append(f"[{m['id']}] {tag}{who}：{m.get('text', '')}")
+        pre_txt = ""
+        if prelude:
+            pre_lines = [f"{'群' + str(m.get('gid') or '') + ' ' if m.get('gid') else ''}"
+                         f"{m.get('nick') or '群友'}：{m.get('text', '')}"
+                         for m in prelude]
+            pre_txt = ("【前情提要·上一批结尾（仅供理解上下文，不要重复整理）】\n"
+                       + "\n".join(pre_lines) + "\n\n")
         ask = (f"当前时间 {time.strftime('%Y-%m-%d %H:%M')}。"
-               f"共 {len(pool_msgs)} 条消息。\n\n" + "\n".join(lines))
+               f"共 {len(pool_msgs)} 条消息。\n\n" + pre_txt + "\n".join(lines))
         try:
             out, resp = await complete_text_resp(
                 llm, BATCH_COMPRESS_PROMPT, ask,
-                max_tokens=4000, temperature=0.3)
+                max_tokens=8000, temperature=0.3)
         except Exception:
             # v0.2.15 审查修：调用方按 3 元组解包——少返回一项会让整个
             # flush 任务 ValueError 挂掉，整批消息搁浅在 pending 里，
@@ -225,21 +286,20 @@ class GroupMemory:
         entries = self.parse_batch_output(out)
         if not entries:
             return 0, [], None
-        est = sum(CandidatePool._est(m.get("text", "")) + 12
+        est = sum(_pool_est(m.get("text", "")) + 12
                   for m in pool_msgs)
-        est += 4000 // 2
+        est += 8000 // 2
         return est, entries, resp
 
     def compress_pool_batch(self, pool_msgs: list[dict],
                             entries: list[dict]) -> int:
         """把模型拆好的多篇话题日记入库（evidence 记证据消息 id）。
 
-        pool_msgs: 本批原文（CandidatePool.take_all 的结果，含 id）；
-        entries: 解析出的 [{title,tags,summary,content,evidence}]。
-        返回入库篇数。
+        v0.3.0：每篇的 gid 取证据消息里出现最多的群号（公共记忆里仍记
+        来源群，检索/展示可用），写进 entries.gid。
         """
         n = 0
-        id2ts = {m["id"]: m.get("ts") for m in pool_msgs}
+        id2msg = {m["id"]: m for m in pool_msgs}
         for e in entries:
             title = str(e.get("title") or "").strip()[:40]
             summary = str(e.get("summary") or "").strip()
@@ -249,14 +309,18 @@ class GroupMemory:
             content = str(e.get("content") or "").strip()[:600]
             ev = [int(x) for x in (e.get("evidence") or [])
                   if str(x).isdigit()][:10]
-            ts = (id2ts.get(ev[0]) if ev else None) or \
+            gid_counts: dict[int, int] = {}
+            for mid in ev:
+                m = id2msg.get(mid)
+                if m:
+                    gid_counts[int(m.get("gid") or 0)] = \
+                        gid_counts.get(int(m.get("gid") or 0), 0) + 1
+            gid = max(gid_counts, key=gid_counts.get) if gid_counts else \
+                int(pool_msgs[0].get("gid") or 0) if pool_msgs else 0
+            ts = (id2msg.get(ev[0], {}).get("ts") if ev else None) or \
                  (pool_msgs[0].get("ts") if pool_msgs else time.time())
-            # evidence 存进 tags 前缀无法表达——放 meta：diary.add 无该列，
-            # 用约定格式存 tags 之外再存进 content 头部注释？不——
-            # DiaryStore.entries 有 grams/tags/content 列；evidence 用
-            # 独立 meta 表按日记 id 存（见 store_evidence）。
             eid = self.diary.add(ts, tags, summary, 0,
-                                 title=title, content=content)
+                                 title=title, content=content, gid=gid)
             if ev:
                 self.diary.set_meta(f"evidence_{eid}", json.dumps(ev))
             n += 1

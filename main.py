@@ -45,7 +45,7 @@ from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text
 
-PLUGIN_VERSION = "0.2.14"
+PLUGIN_VERSION = "0.2.15"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -262,13 +262,13 @@ class QQMindPlugin(star.Star):
         return p
 
     async def _flush_pool(self, gid: int) -> None:
-        """候选池攒满 → 一次模型调用拆成多篇话题日记；失败原样放回。"""
+        """候选池攒满 → 一次模型调用拆成多篇话题日记；失败放回+冷却。"""
         pool = self._pool(gid)
         if not pool.msgs or self._flushing.get(gid):
             return
         self._flushing[gid] = True
         try:
-            batch = pool.take_all()
+            batch = pool.take_all()   # pending 文件已写，崩溃可恢复
             pool.save()
             provider = self.context.get_using_provider()
             if provider is None:
@@ -280,6 +280,7 @@ class QQMindPlugin(star.Star):
             if est <= 0 or not entries:
                 pool.put_back(batch)     # 失败重试：下轮触发再试
                 pool.save()
+                pool.mark_failed()       # 冷却 5 分钟，别每条消息重试一次
                 return
             self._real_usage(resp, "compress")
             n = self._group_mem(gid).compress_pool_batch(batch, entries)
@@ -288,10 +289,10 @@ class QQMindPlugin(star.Star):
             try:
                 import json as _json
                 self._group_mem(gid).diary.set_meta(
-                    "evidence_archive",
-                    _json.dumps(batch, ensure_ascii=False)[:200000])
+                    "evidence_archive", _json.dumps(batch, ensure_ascii=False))
             except Exception as e:
                 logger.debug(f"[qqmind] evidence archive failed: {e!r}")
+            pool.confirm_taken()   # 整批正式交割，删 pending
             self._budget().add(int(est), gid=int(gid))
             logger.info(f"[qqmind] pool flush for {gid}: {len(batch)} msgs "
                         f"-> {n} diary entries, est {est} tok")
@@ -420,7 +421,8 @@ class QQMindPlugin(star.Star):
         slot["in_hit"] += int(getattr(usage, "input_cached", 0) or 0)
         slot["in_miss"] += int(getattr(usage, "input_other", 0) or 0)
         slot["out"] += int(getattr(usage, "output", 0) or 0)
-        b._save()
+        # 不单独落盘：调用方紧跟的 _count_usage/budget.add 会 save，
+        # 判读每条消息一次，单独 save 是无谓 IO（v0.2.14 审查修）
 
     def _maybe_quota_notice(self, gid: int, event: AstrMessageEvent) -> None:
         """额度耗尽时明说一次，每群每天最多 N 次。"""
@@ -805,14 +807,14 @@ class QQMindPlugin(star.Star):
             headers = self._group_mem(gid).diary_headers(
                 int(self._cfg("diary_headers_in_prompt", 8)))
             if headers:
-                tail.append((2, "你有本群的日记（时间 标题，想细看就输出 "
+                tail.append((3, "你有本群的日记（时间 标题，想细看就输出 "
                                  "<查群日记\"关键词或时间\">）：\n" + headers))
             # 跨群共享记忆（v0.2.7，默认关）：其他群的日记标题也带进来，
             # 模型用 <查别群日记"群号:关键词"> 寻回——群间隐私默认隔离
             if self._cfg("share_memory_across_groups", False):
                 cross = self._cross_group_headers(gid)
                 if cross:
-                    tail.append((3,
+                    tail.append((4,
                                  "你在其他群也有日记（想看就输出 "
                                  "<查别群日记\"群号:关键词或时间\">，"
                                  "群号必须带上）：\n" + cross))
@@ -825,18 +827,20 @@ class QQMindPlugin(star.Star):
         if n_ctx:
             ctx = "\n".join(self.group_buffer.recent(gid, n_ctx))
             if ctx:
-                tail.append((4, f"【最近的群聊（供理解语境，不必逐条回应）】"
+                tail.append((2, f"【最近的群聊（供理解语境，不必逐条回应）】"
                                 f"\n{ctx}"))
 
-        # 硬预算裁剪：优先级小的先丢（0 锚定 > 1 召回背景 > 2 日记目录
-        # > 3 跨群目录 > 4 群聊原文窗口）
+        # 硬预算裁剪（v0.2.14 审查修）：预算只约束 tail 增量（stable 段
+        # 常超 700，以它起算会把所有后缀裁光）。
+        # 优先级：0 锚定 > 1 召回背景 > 2 群聊窗口（理解语境必需）
+        # > 3 本群日记目录 > 4 跨群目录；prio>=3 超预算才裁
         budget = int(self._cfg("memory_prompt_budget", 700))
-        used = est_tokens(stable)
+        used = 0
         kept: list[str] = []
         for prio, text in sorted(tail, key=lambda x: x[0]):
             cost = est_tokens(text)
-            if used + cost > budget and prio >= 2:
-                continue   # 高优先级（锚定/召回）超预算也保留
+            if used + cost > budget and prio >= 3:
+                continue
             used += cost
             kept.append(text)
         return stable + "\n" + "\n".join(kept)
@@ -844,12 +848,12 @@ class QQMindPlugin(star.Star):
     _LIVE_CACHE: dict[str, tuple[float, str]] = {}
 
     def _live_mode_text(self) -> str:
-        """活人模板三级来源（v0.2.14 角色包微插件）：
+        """活人模板来源（v0.2.14 角色包微插件），优先级从高到低：
 
-        1. 当前激活角色包目录下 live_mode.md（随包插拔）
-        2. 全局配置 persona_live_mode
-        3. 代码默认 _LIVE_MODE_DEFAULT
-        配置显式设空串 = 强制关闭（跳过 1/3）。
+        1. 配置显式清空 = 强制关闭（包文件也不生效）
+        2. 当前激活角色包目录下 live_mode.md（随包插拔）
+        3. 全局配置 persona_live_mode
+        4. 代码默认 _LIVE_MODE_DEFAULT
         """
         if "persona_live_mode" in (self.plugin_config or {}):
             configured = str(self.plugin_config.get("persona_live_mode")

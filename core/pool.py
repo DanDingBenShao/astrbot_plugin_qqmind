@@ -52,6 +52,7 @@ class CandidatePool:
         self._next_id = 1
         self._pool_tokens = 0
         self._oldest_ts = 0.0
+        self._fail_until = 0.0
         self._load()
 
     # ---------- 持久化 ----------
@@ -68,6 +69,25 @@ class CandidatePool:
         except Exception:
             self.msgs, self._next_id = [], 1
             self._pool_tokens, self._oldest_ts = 0, 0.0
+        # 崩溃恢复（v0.2.14 审查修）：上次取走未交割的整批原样回池
+        try:
+            pp = self.path.parent / f"pool_{int(self.gid)}.pending.json"
+            with open(pp, encoding="utf-8") as f:
+                pending = json.load(f)
+            if isinstance(pending, list) and pending:
+                got = {m["id"] for m in self.msgs}
+                back = [m for m in pending if m.get("id") not in got]
+                if back:
+                    self.msgs = back + self.msgs
+                    self._pool_tokens = sum(self._est(m["text"]) + 12
+                                            for m in self.msgs)
+                    self._oldest_ts = self.msgs[0]["ts"]
+                    ids = [m["id"] for m in self.msgs if isinstance(m.get("id"), int)]
+                    if ids:
+                        self._next_id = max(self._next_id, max(ids) + 1)
+            os.remove(pp)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
 
     def save(self) -> None:
         try:
@@ -114,6 +134,10 @@ class CandidatePool:
         if not self.msgs:
             return False
         now = now or time.time()
+        # 失败退避（v0.2.14 审查修）：压缩刚失败（402/断网）时冷却，
+        # 别让每条新消息都触发一次注定失败的调用
+        if now < self._fail_until:
+            return False
         if self._pool_tokens >= self.trigger_tokens:
             return True
         if (self._oldest_ts
@@ -121,16 +145,46 @@ class CandidatePool:
             return True
         return False
 
+    def mark_failed(self, cooldown_s: float = 300.0) -> None:
+        """压缩失败后的冷却（不落盘——重启即重试，失败态无需持久化）。"""
+        self._fail_until = time.time() + max(30.0, float(cooldown_s))
+
     def take_all(self) -> list[dict]:
-        """取走全部（压缩前调用）；失败重试由调用方放回。"""
+        """取走全部（压缩前调用）。
+
+        v0.2.14 审查修：取走的同时把 batch 写进 pending 文件——压缩调用
+        期间进程崩溃的话，启动时 _load 会把 pending 原样回池，不丢消息。
+        成功入库后调用方必须 confirm_taken() 删 pending。
+        """
         out = self.msgs
         self.msgs = []
         self._pool_tokens = 0
         self._oldest_ts = 0.0
+        try:
+            with open(self._pending_path(), "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+        except OSError as e:
+            import logging
+            logging.getLogger("astrbot").warning(
+                f"[qqmind] pool pending write failed for {self.gid}: {e!r}")
         return out
 
+    def confirm_taken(self) -> None:
+        """压缩成功：删 pending（整批消息正式交割完毕）。"""
+        try:
+            os.remove(self._pending_path())
+        except OSError:
+            pass
+
+    def _pending_path(self) -> Path:
+        return self.path.parent / f"pool_{self.gid}.pending.json"
+
     def put_back(self, msgs: list[dict]) -> None:
-        """压缩失败：原样放回池头（保持 id 与顺序）。"""
+        """压缩失败：原样放回池头（保持 id 与顺序），并清 pending。"""
+        try:
+            os.remove(self._pending_path())
+        except OSError:
+            pass
         if not msgs:
             return
         self.msgs = list(msgs) + self.msgs

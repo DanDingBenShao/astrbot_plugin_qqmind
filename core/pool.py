@@ -65,6 +65,8 @@ class CandidatePool:
         self._oldest_ts = 0.0
         self._fail_until = 0.0
         self._fail_streak = 0
+        self._dropped_total = 0          # 满池丢弃计数（诊断/告警用）
+        self._last_sweep_day = ""        # 最近一次凌晨残余兜底的日期
         self._prelude: list[dict] = []   # 上一批结尾 5 条（跨批话题不断头）
         self._taken: list[dict] = []     # take_all 的批次（confirm 时生成 prelude）
         self._migrate_legacy()
@@ -140,9 +142,17 @@ class CandidatePool:
                                     (self.msgs[0]["ts"] if self.msgs else 0))
             pre = d.get("prelude") or []
             self._prelude = [m for m in pre if isinstance(m, dict)][-5:]
+            self._dropped_total = int(d.get("dropped_total") or 0)
+            raw_sweep = d.get("last_sweep_day")
+            # 旧版池文件没有补扫记账：按“今天已扫”处理，避免升级后立刻
+            # 在白天压一次残余（第一次补扫从明天 04:30 开始）
+            self._last_sweep_day = (time.strftime("%Y-%m-%d")
+                                    if raw_sweep is None
+                                    else str(raw_sweep or ""))
         except Exception:
             self.msgs, self._next_id = [], 1
             self._pool_tokens, self._oldest_ts = 0, 0.0
+            self._dropped_total, self._last_sweep_day = 0, ""
         # 崩溃恢复：上次取走未交割的整批原样回池
         try:
             pp = self._pending_path()
@@ -170,7 +180,9 @@ class CandidatePool:
                 json.dump({"msgs": self.msgs, "next_id": self._next_id,
                            "tokens": self._pool_tokens,
                            "oldest_ts": self._oldest_ts,
-                           "prelude": self._prelude},
+                           "prelude": self._prelude,
+                           "dropped_total": self._dropped_total,
+                           "last_sweep_day": self._last_sweep_day},
                           f, ensure_ascii=False)
             os.replace(tmp, self.path)
         except OSError as e:
@@ -193,10 +205,25 @@ class CandidatePool:
             self._oldest_ts = self.msgs[0]["ts"]
         if len(self.msgs) > self.max_msgs:
             drop = len(self.msgs) - self.max_msgs
-            for m in self.msgs[:drop]:
+            dropped = self.msgs[:drop]
+            for m in dropped:
                 self._pool_tokens -= _est(m["text"]) + 12
             self.msgs = self.msgs[drop:]
             self._oldest_ts = self.msgs[0]["ts"] if self.msgs else 0.0
+            # v0.3.1：丢记忆必须留痕（v0.3.0 是静默丢最老，故障时无从发现）。
+            # 每次丢弃都打会刷屏，按“首次 + 每满 100 条”告警。
+            before = self._dropped_total
+            self._dropped_total += drop
+            if before == 0 or before // 100 != self._dropped_total // 100:
+                import logging
+                gids: dict[int, int] = {}
+                for m in dropped:
+                    g = int(m.get("gid") or 0)
+                    gids[g] = gids.get(g, 0) + 1
+                logging.getLogger("astrbot").warning(
+                    f"[qqmind] pool full ({self.max_msgs}): dropped "
+                    f"{drop} oldest msgs (total {self._dropped_total}, "
+                    f"gids={gids})")
 
     def should_flush(self, now: float | None = None) -> bool:
         """攒够一批才压（v0.3.0：按条数，不再按等待时长）。"""
@@ -217,12 +244,21 @@ class CandidatePool:
         self._fail_streak = 0
         self._fail_until = 0.0
 
-    def take_all(self) -> list[dict]:
-        """取走全部（压缩前调用），批次写 pending 防崩溃丢批。"""
-        out = self.msgs
-        self.msgs = []
-        self._pool_tokens = 0
-        self._oldest_ts = 0.0
+    def take_batch(self, limit: int | None = None) -> list[dict]:
+        """取走最多 limit 条（None=全部），批次写 pending 防崩溃丢批。
+
+        v0.3.1：单批上限由调用方传 trigger_msgs——停机/故障后池子可能涨到
+        max_msgs，整批塞进一次请求会撑爆模型上下文；剩下的留在池里等下一批。
+        """
+        if limit is None:
+            out = self.msgs
+            self.msgs = []
+        else:
+            n = max(1, int(limit))
+            out = self.msgs[:n]
+            self.msgs = self.msgs[n:]
+        self._pool_tokens = sum(_est(m["text"]) + 12 for m in self.msgs)
+        self._oldest_ts = self.msgs[0]["ts"] if self.msgs else 0.0
         self._taken = out
         try:
             with open(self._pending_path(), "w", encoding="utf-8") as f:
@@ -232,6 +268,10 @@ class CandidatePool:
             logging.getLogger("astrbot").warning(
                 f"[qqmind] pool pending write failed: {e!r}")
         return out
+
+    def take_all(self) -> list[dict]:
+        """取走全部（兼容旧调用/测试；生产 flush 用 take_batch 限流）。"""
+        return self.take_batch(None)
 
     def confirm_taken(self) -> None:
         """压缩成功：删 pending；记下本批结尾 5 条做下批「前情提要」。"""
@@ -243,6 +283,7 @@ class CandidatePool:
             self._prelude = [dict(m) for m in self._taken[-5:]]
         self._taken = []
         self.reset_failed()
+        self.save()      # v0.3.1：prelude 随交割落盘（崩溃后不断头）
 
     def _pending_path(self) -> Path:
         return self.dir / "pool_public.pending.json"
@@ -273,6 +314,16 @@ class CandidatePool:
     def prelude(self) -> list[dict]:
         """上一批结尾 5 条（跨批话题的「前情提要」）。"""
         return list(self._prelude)
+
+    # ---------- 每日残余兜底记账 ----------
+    def sweep_done_today(self) -> bool:
+        """今天（本地日期）是否已经做过残余兜底。"""
+        return self._last_sweep_day == time.strftime("%Y-%m-%d")
+
+    def mark_sweep_done(self) -> None:
+        """残余兜底完成（或池本空）：记账并落盘，重启后不重复补扫。"""
+        self._last_sweep_day = time.strftime("%Y-%m-%d")
+        self.save()
 
     def tokens(self) -> int:
         return self._pool_tokens

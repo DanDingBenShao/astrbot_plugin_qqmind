@@ -45,7 +45,7 @@ from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -272,76 +272,103 @@ class QQMindPlugin(star.Star):
         """公共群日记库（v0.3.0）：所有群共用一个 SQLite（entries.gid 记来源群）。
 
         首次创建时把旧的每群 <gid>.db 合并进来（改名 .migrated 备份）。
+        v0.3.1：group_diaries_dir 与 diaries_dir 相同时跳过迁移——否则会把
+        私聊 <uid>.db 当群库并进公共库（隐私事故）。
         """
         if self._pub_diary is None:
             ddir = self._abs_dir("group_diaries_dir", "qqmind_group_diaries")
+            pdir = self._abs_dir("diaries_dir", "qqmind_diaries")
             from .core.diary import DiaryStore
             store = DiaryStore(ddir, 0, name="group_public")
             try:
-                n = DiaryStore.migrate_group_dbs(ddir, store)
-                if n:
-                    logger.info(f"[qqmind] group diaries merged into public: "
-                                f"{n} entries")
+                if os.path.abspath(ddir) == os.path.abspath(pdir):
+                    logger.warning(
+                        "[qqmind] group_diaries_dir == diaries_dir；"
+                        "跳过旧群库迁移以保护私聊日记")
+                else:
+                    n = DiaryStore.migrate_group_dbs(ddir, store)
+                    if n:
+                        logger.info(f"[qqmind] group diaries merged into public: "
+                                    f"{n} entries")
             except Exception as e:
                 logger.warning(f"[qqmind] group diary migration failed: {e!r}")
             self._pub_diary = store
         return self._pub_diary
 
     def _pool(self) -> CandidatePool:
-        """公共候选池（v0.3.0）：所有群共用，消息自带 gid。"""
+        """公共候选池（v0.3.0）：所有群共用，消息自带 gid。
+
+        v0.3.1：阈值每次读取都同步到已建实例——控制台改完立即生效，不必重载。
+        """
+        trig = max(5, int(self._cfg("pool_trigger_msgs", 1000)))
+        mx = max(trig + 100, int(self._cfg("pool_max_msgs", 3000)))
         if self._pub_pool is None:
             self._pub_pool = CandidatePool(
                 self._abs_dir("pool_dir", "qqmind_pool"),
-                trigger_msgs=int(self._cfg("pool_trigger_msgs", 1000)),
-                max_msgs=int(self._cfg("pool_max_msgs", 3000)))
+                trigger_msgs=trig, max_msgs=mx)
+        else:
+            self._pub_pool.trigger_msgs = trig
+            self._pub_pool.max_msgs = mx
         return self._pub_pool
 
-    async def _flush_pool(self) -> None:
-        """池子攒满（或凌晨残余兜底）→ 一次模型调用拆成多篇话题日记。"""
+    async def _flush_pool(self) -> bool:
+        """池子攒满（或凌晨残余兜底）→ 一次模型调用拆成多篇话题日记。
+
+        返回 True=本批成功交割（含模型确认“没有值得记的内容”的合法空结果）；
+        False=调用/入库失败或已有压缩在跑，消息仍在池里。
+        """
         pool = self._pool()
         if not pool.msgs or self._flushing.get(0):
-            return
+            return False
         self._flushing[0] = True
+        batch: list[dict] = []
+        confirmed = False
         try:
-            batch = pool.take_all()   # pending 文件已写，崩溃可恢复
+            # v0.3.1：单批最多 trigger_msgs 条——停机/故障后池子可能涨到
+            # max_msgs，整批塞进一次请求会撑爆上下文；剩下的留给下一批
+            batch = pool.take_batch(pool.trigger_msgs)
             pool.save()
             provider = self.context.get_using_provider()
             if provider is None:
                 pool.put_back(batch)
                 pool.save()
-                return
+                return False
             # 前情提要：上一批结尾 5 条，跨批话题不断头（v0.3.0）
             prelude = pool.prelude()
-            est, entries, resp = await self._group_mem(batch[0]["gid"] if batch
-                                                       else 0).compress_pool_call(
+            gm0 = self._group_mem(batch[0]["gid"] if batch else 0)
+            est, entries, resp = await gm0.compress_pool_call(
                 provider, batch, prelude=prelude)
-            if est <= 0 or not entries:
-                pool.put_back(batch)     # 失败重试：下轮触发再试
+            if entries is None:          # 调用失败 / 输出捞不出 JSON
+                pool.put_back(batch)
                 pool.save()
                 pool.mark_failed()       # 指数退避（5→10→20→40→60min）
                 logger.warning(f"[qqmind] pool flush failed: "
                                f"{len(batch)} msgs put back, "
                                f"backoff streak={pool._fail_streak}")
-                return
-            self._real_usage(resp, "compress")
-            gm0 = self._group_mem(batch[0]["gid"] if batch else 0)
-            n = gm0.compress_pool_batch(batch, entries)
-            # 原文归档（v0.3.0）：保留最近 10 批（旧版只留 1 批，证据链
-            # 寿命太短）；meta 存 JSON 数组的数组
-            try:
-                import json as _json
-                store = self._group_diary()
-                raw = store.get_meta("evidence_archive")
-                batches = _json.loads(raw) if raw else []
-                if not isinstance(batches, list):
-                    batches = []
-                batches.append(batch)
-                batches = batches[-10:]
-                store.set_meta(
-                    "evidence_archive", _json.dumps(batches, ensure_ascii=False))
-            except Exception as e:
-                logger.debug(f"[qqmind] evidence archive failed: {e!r}")
+                return False
+            if resp is not None:
+                self._real_usage(resp, "compress")
+            n = 0
+            if entries:                  # [] = 这批没有值得记的内容，正常清池
+                n = gm0.compress_pool_batch(batch, entries)
+                # 原文归档（v0.3.0）：保留最近 10 批（旧版只留 1 批，证据链
+                # 寿命太短）；meta 存 JSON 数组的数组
+                try:
+                    import json as _json
+                    store = self._group_diary()
+                    raw = store.get_meta("evidence_archive")
+                    batches = _json.loads(raw) if raw else []
+                    if not isinstance(batches, list):
+                        batches = []
+                    batches.append(batch)
+                    batches = batches[-10:]
+                    store.set_meta(
+                        "evidence_archive",
+                        _json.dumps(batches, ensure_ascii=False))
+                except Exception as e:
+                    logger.debug(f"[qqmind] evidence archive failed: {e!r}")
             pool.confirm_taken()   # 正式交割，删 pending，记前情提要
+            confirmed = True
             # 分群记预算：按批内各群消息占比分摊 est
             try:
                 from collections import Counter
@@ -349,10 +376,30 @@ class QQMindPlugin(star.Star):
                 total = sum(cnt.values()) or 1
                 for g, c in cnt.items():
                     self._budget().add(int(est * c / total), gid=g)
-            except Exception:
-                self._budget().add(int(est), gid=0)
+            except Exception as e:
+                logger.debug(f"[qqmind] pool budget attribution failed: {e!r}")
+                try:
+                    self._budget().add(int(est), gid=0)
+                except Exception:
+                    pass
             logger.info(f"[qqmind] pool flush: {len(batch)} msgs "
                         f"-> {n} diary entries, est {est} tok")
+            return True
+        except asyncio.CancelledError:
+            # 卸载/取消：把本批放回池，别让 pending 在下次 take_batch 时被覆盖
+            if not confirmed and batch:
+                pool.put_back(batch)
+                pool.save()
+            raise
+        except Exception as e:
+            # v0.3.1：压缩成功后的入库/归档异常也必须回滚——否则 pending
+            # 会被下一批 take_batch 覆盖，整批永久丢失（BUG-6 同类）
+            logger.warning(f"[qqmind] pool flush crashed, batch put back: {e!r}")
+            if not confirmed and batch:
+                pool.put_back(batch)
+                pool.save()
+                pool.mark_failed()
+            return False
         finally:
             self._flushing[0] = False
 
@@ -445,6 +492,13 @@ class QQMindPlugin(star.Star):
 
     async def _pool_sweep_loop(self) -> None:
         try:
+            # v0.3.1：启动补扫——04:30 已过且今天还没扫过，5 分钟后补一次。
+            # 旧版只在进程活到 04:30 时才扫，开发期频繁重载会让残余等 24h。
+            await asyncio.sleep(300)
+            try:
+                await self._sweep_residual_if_due()
+            except Exception as e:     # noqa: BLE001
+                logger.warning(f"[qqmind] startup residual sweep failed: {e!r}")
             while True:
                 # 睡到下一个 04:30（本地时区）
                 now = time.localtime()
@@ -453,16 +507,39 @@ class QQMindPlugin(star.Star):
                 if target <= time.time():
                     target += 86400
                 await asyncio.sleep(max(30.0, target - time.time()))
-                pool = self._pool()
-                if pool.msgs:
-                    try:
-                        logger.info(f"[qqmind] daily residual sweep: "
-                                    f"{len(pool.msgs)} msgs")
-                        await self._flush_pool()
-                    except Exception as e:     # noqa: BLE001
-                        logger.warning(f"[qqmind] residual sweep failed: {e!r}")
+                try:
+                    await self._sweep_residual_if_due(force=True)
+                except Exception as e:     # noqa: BLE001
+                    logger.warning(f"[qqmind] residual sweep failed: {e!r}")
         except asyncio.CancelledError:
             pass
+
+    async def _sweep_residual_if_due(self, force: bool = False) -> None:
+        """每天最多做一次残余兜底；启动补扫只在 04:30 之后执行。
+
+        force=True 用于 04:30 定时触发；启动补扫用默认值（未过 04:30 就跳过）。
+        一批最多压 trigger_msgs 条，最多连续 5 批；全部成功清空才记账，
+        失败不记账——下次启动或明天还会再试。
+        """
+        pool = self._pool()
+        if not force:
+            now = time.localtime()
+            if (now.tm_hour, now.tm_min) < (4, 30):
+                return
+        if pool.sweep_done_today():
+            return
+        if not pool.msgs:
+            pool.mark_sweep_done()
+            return
+        logger.info(f"[qqmind] daily residual sweep: {len(pool.msgs)} msgs")
+        for _ in range(5):
+            if not pool.msgs:
+                break
+            ok = await self._flush_pool()
+            if not ok:
+                return          # 失败：不记账，等下次启动/明天补
+        if not pool.msgs:
+            pool.mark_sweep_done()
 
     def _ensure_proactive_loop(self) -> None:
         """守护循环懒启动（首个私聊会话建立时）；

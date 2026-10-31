@@ -22,6 +22,11 @@ from .private import PrivateSession, complete_text, complete_text_resp
 from .pool import BATCH_COMPRESS_PROMPT, _est as _pool_est
 
 
+def _one_line(text: str) -> str:
+    """压缩请求一行一条消息：换行会打断 [id] 前缀，统一换成可见的 ⏎。"""
+    return (text or "").replace("\r", "").replace("\n", " ⏎ ")
+
+
 def _salvage_json_array(text: str) -> list:
     """从被截断的 JSON 数组里捞回已完整的对象（v0.3.0 截断容错）。
 
@@ -231,8 +236,12 @@ class GroupMemory:
 
     # ---------- 候选池合批压缩（v0.3.0 公共池） ----------
     @staticmethod
-    def parse_batch_output(out: str) -> list[dict]:
+    def parse_batch_output(out: str) -> list[dict] | None:
         """解析合批压缩输出 JSON 数组（容错剥围栏 + 截断 salvage）。
+
+        返回 None = 协议失败（连一个完整对象都捞不到）——调用方应回池重试；
+        返回 []   = 合法空结果（模型确认这批没有值得记的内容）——不能当失败，
+        否则纯寒暄的残余会永远压不掉、每天白烧一次调用（v0.3.1 修）。
 
         截断 salvage（v0.3.0）：模型输出超预算被截断时，扫到最后一个完整
         对象为止，捞回已完整的篇目——剩下一刀切整批失败会双倍烧钱。
@@ -244,19 +253,23 @@ class GroupMemory:
             v = json.loads(t)
         except Exception:
             v = _salvage_json_array(t)
+            if not v:              # 不是 JSON，也捞不出完整对象 → 协议失败
+                return None
         if isinstance(v, dict):     # 容错：单个对象也收
             v = [v]
         if not isinstance(v, list):
-            return []
+            return None
         return [e for e in v if isinstance(e, dict)]
 
     async def compress_pool_call(self, llm, pool_msgs: list[dict],
                                  prelude: list[dict] | None = None
-                                 ) -> tuple[int, list[dict], object]:
+                                 ) -> tuple[int, list[dict] | None, object]:
         """一次调用把整批原文拆成多篇话题日记。
 
         prelude：上一批结尾 5 条原文（只供理解，不参与入库）——跨批话题
-        不断头。返回 (est_tokens, entries, resp)；est=0 表示调用或解析失败。
+        不断头。返回 (est_tokens, entries, resp)：
+        - entries=None → 调用/解析失败，调用方整批回池并退避；
+        - entries=[]   → 合法空结果（这批没有值得记的内容），应正常交割清池。
         """
         lines = []
         for m in pool_msgs:
@@ -264,11 +277,11 @@ class GroupMemory:
                   (m.get("nick") or "群友")
             gid = m.get("gid") or 0
             tag = f"群{gid} " if gid else ""
-            lines.append(f"[{m['id']}] {tag}{who}：{m.get('text', '')}")
+            lines.append(f"[{m['id']}] {tag}{who}：{_one_line(m.get('text', ''))}")
         pre_txt = ""
         if prelude:
             pre_lines = [f"{'群' + str(m.get('gid') or '') + ' ' if m.get('gid') else ''}"
-                         f"{m.get('nick') or '群友'}：{m.get('text', '')}"
+                         f"{m.get('nick') or '群友'}：{_one_line(m.get('text', ''))}"
                          for m in prelude]
             pre_txt = ("【前情提要·上一批结尾（仅供理解上下文，不要重复整理）】\n"
                        + "\n".join(pre_lines) + "\n\n")
@@ -282,10 +295,10 @@ class GroupMemory:
             # v0.2.15 审查修：调用方按 3 元组解包——少返回一项会让整个
             # flush 任务 ValueError 挂掉，整批消息搁浅在 pending 里，
             # 下批成功时 pending 被覆盖、上一批永久丢失
-            return 0, [], None
+            return 0, None, None
         entries = self.parse_batch_output(out)
-        if not entries:
-            return 0, [], None
+        if entries is None:
+            return 0, None, None
         est = sum(_pool_est(m.get("text", "")) + 12
                   for m in pool_msgs)
         est += 8000 // 2

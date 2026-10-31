@@ -16,7 +16,7 @@ desc: |
   人设：浅层状态 + 深层性格常驻，背景故事按篇章库管理（标题常驻、正文关键词召回）。
   护栏：每日 token 预算熔断、每群频率上限、@全体忽略、bot 互怼拦截。
   判读/压缩/回复可分别指定模型（judge_model/think_model），单模型也能跑。
-version: 0.3.1
+version: 0.3.2
 author: DanDingBenShao
 repo: https://github.com/DanDingBenShao/astrbot_plugin_qqmind
 astrbot_version: ">=4.29.0"

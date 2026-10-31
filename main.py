@@ -45,7 +45,7 @@ from .core import proactive
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.2"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -55,6 +55,12 @@ _DIARY_CMD_RE = re.compile(r'<查日记"([^"]{1,60})">')
 _GROUP_DIARY_CMD_RE = re.compile(r'<查群日记"([^"]{1,60})">')
 _CROSS_DIARY_CMD_RE = re.compile(r'<查别群日记"(\d{5,12})[:：]([^"]{1,60})">')
 _EXPAND_CMD_RE = re.compile(r'<看日记"#?(\d{1,4})">')
+
+# 私聊记忆提问识别（v0.3.2）：命中时先本地检索日记再答，不指望模型主动
+# 输出 <查日记"…">（实测它经常不动）。只在命中时增加少量 token。
+_MEMORY_Q_RE = re.compile(
+    r"还记得|记得吗|记得么|记不记得|上次|上回|之前|以前|昨天|前天|"
+    r"上周|上个月|我们说|我说过|你答应|你上次|聊过|提过|那次")
 
 # 详细场景识别（v0.2.10）：对方在要"讲清楚"的内容时放宽群聊截断。
 # 命中面=求做法/求原因/求解释/讲题/求证/纠错，不含纯闲聊。
@@ -1590,7 +1596,19 @@ class QQMindPlugin(star.Star):
             return
         if event.is_private_chat():
             p = self._private(uid)
-            profile = self._private_system_prompt(p, event.message_str or "")
+            q = (event.message_str or "").strip()
+            profile = self._private_system_prompt(p, q)
+            # v0.3.2：记忆类提问先本地预检索（模型常忘记输出 <查日记> 标记）
+            if q and _MEMORY_Q_RE.search(q):
+                try:
+                    found = p.diary.search(q, n=3)
+                except Exception as e:
+                    found = ""
+                    logger.debug(f"[qqmind] private pre-recall failed: {e!r}")
+                if found and "没有找到日记" not in found:
+                    profile = (profile + "\n【用户可能在问过去的事；下面是从日记"
+                               "预检索到的结果，够答就直接答，不够再输出 "
+                               "<查日记\"关键词\">】\n" + found).strip()
             if profile:
                 req.system_prompt = (profile + "\n"
                                      + (req.system_prompt or "")).strip()
@@ -1851,9 +1869,11 @@ class QQMindPlugin(star.Star):
             p = self._private(uid)
             cap = int(self._cfg("max_msg_tokens", 100)) * 4
             async with self._hist_lock:
-                if text and est_tokens(text) <= cap:
-                    p.messages.append({"role": "user", "content": text, "ts": time.time()})
-                p.messages.append({"role": "assistant", "content": reply, "ts": time.time()})
+                if text:
+                    p.append_user_message(text, cap)   # 超长截断保存
+                p.messages.append({"role": "assistant", "content": reply,
+                                   "ts": time.time()})
+                p.save_window()                        # v0.3.2：重启不失忆
                 need = p.over_budget()
             if need:
                 asyncio.create_task(self._compress_private(p))
@@ -1964,6 +1984,7 @@ class QQMindPlugin(star.Star):
         self._proactive.mark_sent(uid)
         p.messages.append({"role": "assistant", "content": greeting,
                            "ts": time.time(), "proactive": True})
+        p.save_window()
         self._STATS["proactive_sent"] = self._STATS.get("proactive_sent", 0) + 1
         logger.info(f"[qqmind] proactive greeting -> {uid}: {greeting[:40]}")
 
@@ -1992,6 +2013,7 @@ class QQMindPlugin(star.Star):
                     t.cancel()
         self._runtime.clear()
         for p in self.privates.values():
+            p.save_window()      # v0.3.2：卸载前把内存窗口落盘
             p.diary.close()
         self.privates.clear()
         for gm in self.memories.values():

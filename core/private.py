@@ -65,10 +65,63 @@ class PrivateSession:
                  keep_ratio: float = 0.34):
         self.uid = int(uid)
         self.budget = int(budget)              # 窗口 token 预算（可调）
-        self.keep_ratio = keep_ratio           # 溢出时保留前 1/3 不动，压后面的？反向：压最老的 1/3
+        self.keep_ratio = keep_ratio           # 兼容旧配置（当前算法按预算切，不使用）
         self.messages: list[dict] = []         # [{"role","content","ts"}]
         self.diary = DiaryStore(diaries_dir, uid)
         self.compressing = False
+        self._load_window()                    # v0.3.2：窗口随日记库持久化
+
+    # ---------- 窗口持久化（v0.3.2） ----------
+    def _load_window(self) -> None:
+        """从该用户日记库的 meta 恢复最近窗口（插件重载/重启不再失忆）。"""
+        raw = self.diary.get_meta("window")
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(data, list):
+            return
+        msgs: list[dict] = []
+        for m in data:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content")
+            if role not in ("user", "assistant") or not isinstance(content, str):
+                continue
+            try:
+                ts = float(m.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            msgs.append({"role": role, "content": content, "ts": ts})
+        self.messages = msgs[-1000:]           # 防御性上限；超预算由压缩收
+
+    def save_window(self) -> None:
+        """窗口写回日记库 meta：和日记同库同生命周期，隐私边界不变。"""
+        try:
+            self.diary.set_meta(
+                "window", json.dumps(self.messages, ensure_ascii=False))
+        except Exception as e:
+            print("[private] save window error:", repr(e))
+
+    def append_user_message(self, text: str, cap_tokens: int = 400) -> None:
+        """用户消息入窗口。超长消息截断保存（头 2/3、尾 1/3），不再整条丢。
+
+        v0.3.2：旧版超过 max_msg_tokens 直接不入窗口，长消息（告白/方案/长文）
+        在上下文里彻底消失；现在至少保留大意和结尾。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if est_tokens(text) > cap_tokens:
+            head = max(200, cap_tokens * 2)
+            tail = max(100, cap_tokens)
+            if len(text) > head + tail:      # 真有中间段才省略，短消息原样留
+                text = (text[:head] + "\n…（中间省略）…\n" + text[-tail:])
+        self.messages.append({"role": "user", "content": text,
+                              "ts": time.time()})
 
     # ---------- 窗口 token 账 ----------
     def window_tokens(self) -> int:
@@ -156,6 +209,7 @@ class PrivateSession:
             self.diary.add(first_ts, tags, summary, tok, title=title,
                            content=content)
             del self.messages[:len(msgs)]
+            self.save_window()
             return tok + 200
         except Exception as e:
             print("[private] compress error:", repr(e))

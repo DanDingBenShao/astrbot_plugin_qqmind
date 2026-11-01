@@ -41,6 +41,12 @@
     "type": "int",
     "default": 20
   },
+  "reply_context_messages": {
+    "description": "全量/分层模式回复时逐字 contexts 附带条数（0=不带，默认）",
+    "type": "int",
+    "default": 0,
+    "hint": "语境已在 system 提示词的浅层窗口里，这里是叠加的第二份逐字原文；群活跃时开着 token 翻倍烧。想要旧行为：全量填 60、分层填 20"
+  },
   "memory_layering": {
     "description": "高级档开关A：记忆分层（浅层原文 + 深层群日记）",
     "type": "bool",

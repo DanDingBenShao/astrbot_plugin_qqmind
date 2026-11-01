@@ -184,6 +184,7 @@ _CONFIG_KEYS = (
     "judge_no_think", "compress_no_think",
     "judge_fail_threshold", "bot_qq_ids", "allowed_groups",
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
+    "reply_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "max_msg_tokens",
     "group_reply_max_chars", "group_reply_detail_chars",
@@ -997,9 +998,13 @@ class QQMindPlugin(star.Star):
             return self._group_mem(gid).precise_context(uid)
         if self._is_light():
             return []
-        limit = (int(self._cfg("group_flat_messages", 60))
-                 if mode == "flat"
-                 else int(self._cfg("group_shallow_messages", 20)))
+        # 回复附带条数可控（v0.3.5 账单驱动）：0=不带群聊语境。
+        # 默认 0：上下文在群聊场景主要靠 system 提示词里的浅层窗口
+        # （group_context_messages / 精确记忆线），flat/layered 的逐字
+        # contexts 是叠加的第二份语境，群活跃时 token 翻倍烧。
+        limit = int(self._cfg("reply_context_messages", 0))
+        if limit <= 0:
+            return []
         return self._group_mem(gid).flat_context(limit, skip_last=skip_last)
 
     # ---------- 人设三层 + 背景故事 ----------

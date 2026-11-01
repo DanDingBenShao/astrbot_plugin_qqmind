@@ -1,4 +1,4 @@
-"""群聊记忆体（qqmind）—— AstrBot 插件。
+"""Token消耗高级优化（QQ机器人套件）—— AstrBot 插件（qqmind）。
 
 三个挂点（全部走 AstrBot 官方扩展机制，不改 AstrBot 源码）：
 1. @filter.event_message_type(ALL) 事件监听：浅层判读门。
@@ -219,7 +219,7 @@ def _strip_own_prefix(nick: str, content: str) -> str:
 
 
 class QQMindPlugin(star.Star):
-    """群聊记忆体：判读门 + 深层记忆 + 私聊日记。"""
+    """Token消耗高级优化（QQ机器人套件）：判读门 + 深层记忆 + 私聊日记。"""
 
     def __init__(self, context: star.Context, config=None):
         super().__init__(context)

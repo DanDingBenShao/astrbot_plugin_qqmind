@@ -1,4 +1,6 @@
-# astrbot_plugin_qqmind · 群聊记忆体
+# Token消耗高级优化（QQ机器人套件）· astrbot_plugin_qqmind
+
+> 作者：**本少** (DanDingBenShao)
 
 为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 装上一套可配置的群聊记忆管线：**浅层判读门省 token，深层记忆可寻回**。
 

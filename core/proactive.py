@@ -37,6 +37,7 @@ class ProactiveState:
         self.sent: dict[int, int] = {}          # uid -> 今日已发
         self.no_reply: dict[int, int] = {}      # uid -> 连续未回应次数
         self.cool_until: dict[int, float] = {}  # uid -> 冷却截止 ts
+        self.counted: dict[int, float] = {}     # 已记过未回应的那条主动消息 ts（幂等）
 
     def _roll_day(self) -> None:
         today = time.strftime("%Y-%m-%d")
@@ -70,6 +71,23 @@ class ProactiveState:
 
     def mark_replied(self, uid: int) -> None:
         self.no_reply[uid] = 0
+
+    def sweep_no_reply(self, uid: int, last_pro_ts: float,
+                       last_user_ts: float, limit: int) -> bool:
+        """主动消息 24h 无回应判定（幂等：同一条主动消息只记一次）。
+
+        返回 True = 本次判定触发 7 天冷却。发完主动消息没人理时由
+        _proactive_tick 每轮调用——没有这步，mark_no_reply 就是死代码，
+        「连续 no_reply_limit 次没回应 → 冷却 7 天」护栏形同虚设。
+        """
+        if not last_pro_ts or last_pro_ts <= (last_user_ts or 0):
+            return False
+        if time.time() - last_pro_ts < 86400:
+            return False
+        if self.counted.get(uid, 0) >= last_pro_ts:
+            return False
+        self.counted[uid] = last_pro_ts
+        return self.mark_no_reply(uid, limit)
 
 
 def in_quiet_hours(now: time.struct_time | None = None,

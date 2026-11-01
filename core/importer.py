@@ -20,7 +20,7 @@ import json
 import time
 
 from .core import est_tokens
-from .private import PrivateSession, complete_text
+from .private import PrivateSession, complete_text_resp
 
 # 压缩切块：一次喂给压缩模型的对话预算（和在线压缩 30 条量级对齐）
 CHUNK_TOKENS = 2000
@@ -219,18 +219,26 @@ class ImportJob:
         }
 
 
-async def run_import(job: ImportJob, diary, llm) -> None:
+async def run_import(job: ImportJob, diary, llm, budget=None) -> None:
     """后台执行：逐块压缩进日记，再跑一遍画像提取。
 
     diary: DiaryStore（已按 uid 打开）；llm: provider（text_chat/complete）。
+    budget: DailyBudget——导入一次几十上百块调用，token 必须进当日总账，
+    否则「今日账单」在导入日严重失真、预算熔断对导入无效（v0.3.5 修）。
     失败块跳过继续（导入是尽力而为，中断的原文不丢——源数据还在）。
     """
     try:
         for chunk in chunk_messages(job.msgs):
             ask = (f"当前时间 {time.strftime('%Y-%m-%d %H:%M')}。\n\n"
                    + _excerpt(chunk))
-            out = await complete_text(llm, _compress_prompt(),
-                                      ask, max_tokens=600, temperature=0.3)
+            out, resp = await complete_text_resp(
+                llm, _compress_prompt(), ask, max_tokens=600, temperature=0.3)
+            u = getattr(resp, "usage", None)
+            if budget is not None and u is not None:
+                try:
+                    budget.add(int(u.total), gid=0)
+                except Exception:
+                    pass
             parsed = PrivateSession.parse_compress_output(out)
             if parsed:
                 title, tags, summary, content = parsed
@@ -245,7 +253,7 @@ async def run_import(job: ImportJob, diary, llm) -> None:
             job.done_chunks += 1
         # 画像提取：全量记录一遍过（截断防超长）
         job.state = "extracting"
-        profile = await extract_profile(llm, job.msgs)
+        profile = await extract_profile(llm, job.msgs, budget=budget)
         if profile:
             job.profile = profile
         job.state = "done"
@@ -262,15 +270,22 @@ def _compress_prompt() -> str:
     return COMPRESS_PROMPT
 
 
-async def extract_profile(llm, msgs: list[dict]) -> dict | None:
+async def extract_profile(llm, msgs: list[dict], budget=None) -> dict | None:
     """全量记录 → 用户画像 JSON。失败返回 None（导入照常完成）。"""
     text = _excerpt(msgs)
     if len(text) > 24000:      # 画像提取看大意，超长截断
         text = text[:12000] + "\n…（中段截断）…\n" + text[-12000:]
     try:
-        out = await complete_text(llm, PROFILE_PROMPT,
-                                  f"历史聊天记录：\n{text}",
-                                  max_tokens=500, temperature=0.3)
+        out, resp = await complete_text_resp(
+            llm, PROFILE_PROMPT, f"历史聊天记录：\n{text}",
+            max_tokens=500, temperature=0.3)
+        if budget is not None:
+            u = getattr(resp, "usage", None)
+            if u is not None:
+                try:
+                    budget.add(int(u.total), gid=0)
+                except Exception:
+                    pass
         t = (out or "").strip()
         if t.startswith("```"):
             t = t.strip("`").lstrip("json").strip()

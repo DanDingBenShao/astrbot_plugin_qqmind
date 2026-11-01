@@ -301,8 +301,17 @@ class GroupMemory:
             return 0, None, None
         est = sum(_pool_est(m.get("text", "")) + 12
                   for m in pool_msgs)
-        est += 8000 // 2
-        return est, entries, resp
+        # 真实 usage 可用时用它（total 口径，与 _count_usage 一致）；
+        # 旧桩没有 usage 才回落估算，估算不再虚增 max_tokens//2
+        # （v0.3.5 审查修：原来无条件 +4000，账单恒定虚高）
+        used = est
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            try:
+                used = int(u.total)
+            except Exception:
+                pass
+        return used, entries, resp
 
     def compress_pool_batch(self, pool_msgs: list[dict],
                             entries: list[dict]) -> int:

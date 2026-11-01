@@ -81,11 +81,15 @@ def promised_draw(reply: str) -> bool:
 
 
 def est_tokens(text: str) -> int:
-    """粗估 token：CJK 1:1，其余 4:1。够做入史门槛与账本，不追求精确。"""
+    """粗估 token：CJK 1:1，其余 4:1。够做入史门槛与账本，不追求精确。
+
+    非空文本至少记 1：int() 截断会把纯英文短句（"ok"=0.5）算成 0，
+    私聊窗口预算对英文会话永远不超（v0.3.5 审查修）。
+    """
     n = 0
     for c in text or "":
         n += 1 if ord(c) > 0x2E80 else 0.25
-    return int(n)
+    return max(1, int(n + 0.5)) if (text or "").strip() else 0
 
 
 def parse_judge_verdict(out: str) -> tuple[bool, bool] | None:
@@ -187,14 +191,20 @@ class GroupBuffer:
     重启清零（内存态，可接受）。判读取最近 7 条，轻量档语境取 20 条。
     """
 
-    def __init__(self, max_len: int = 60):
+    def __init__(self, max_len: int = 60, max_item_tokens: int = 0):
         self.max_len = int(max_len)
+        # 单条入缓冲 token 上限（0=不限）：一条 4000 字消息原样进判读
+        # 语境会把判读提示词撑爆，与 max_msg_tokens 入史门槛同口径（v0.3.5）
+        self.max_item_tokens = int(max_item_tokens)
         self.buf: dict[int, list[str]] = {}
 
     def note(self, gid: int, nick: str, text: str) -> None:
         text = (text or "").strip()
         if not gid or not text:
             return
+        if self.max_item_tokens > 0 and est_tokens(text) > self.max_item_tokens:
+            # CJK 1:1 最坏口径：直接按 token 数截字符，截完必不超
+            text = text[: self.max_item_tokens].rstrip() + "…"
         b = self.buf.setdefault(int(gid), [])
         b.append(f"{nick}：{text.replace(chr(10), '；')}")
         if len(b) > self.max_len:
@@ -305,6 +315,7 @@ def split_bubbles(reply: str, max_bubbles: int = 5,
             # 折行符不算显示宽度（手机上换行不占字符预算）
             return len(s.replace("\n", ""))
 
+        truncated = False
         for b in bubbles:
             room = max_total_chars - used
             if room <= 0:
@@ -318,8 +329,10 @@ def split_bubbles(reply: str, max_bubbles: int = 5,
                 cut = b[:max(1, room - 1)].rstrip("，、；：") + "…"
                 kept.append(cut)
                 used = max_total_chars
+                truncated = True
                 break
-        if kept and used >= max_total_chars:
+        if kept and truncated:
+            # 只有真截断过才补省略号；恰好用满预算的内容原样收尾
             kept[-1] = kept[-1].rstrip("，、；：：，、")
             if not kept[-1].endswith("…"):
                 kept[-1] += "…"

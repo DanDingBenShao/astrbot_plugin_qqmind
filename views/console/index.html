@@ -492,10 +492,15 @@
           editor = document.createElement('div');
           editor.className = 'aff-editor';
           editor.style.cssText = 'flex-basis:100%;display:flex;flex-direction:column;gap:4px;padding:6px;background:#f7f9fc;border-radius:8px';
+          // 存储型 XSS 防御加固（v0.3.5）：note/schedule 是用户可控内容，
+          // 后端虽有格式校验，前端插值一律转义（属性值引号逃逸 + HTML 实体）
+          const esc = (s) => String(s ?? '').replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
           editor.innerHTML =
-            `<label>好感度 <b>${u.affinity ?? '-'}</b>/100（手调）<input type="number" min="0" max="100" value="${u.affinity ?? 50}" style="width:70px"></label>` +
-            `<label>备注（作息/称呼/雷点）<textarea rows="2" style="width:100%">${(u.note||'').replace(/</g,'&lt;')}</textarea></label>` +
-            `<label>活跃时段 HH:MM-HH:MM（留空=不限制）<input type="text" value="${u.schedule||''}" placeholder="21:30-23:30" style="width:120px"></label>` +
+            `<label>好感度 <b>${esc(u.affinity)}</b>/100（手调）<input type="number" min="0" max="100" value="${esc(u.affinity ?? 50)}" style="width:70px"></label>` +
+            `<label>备注（作息/称呼/雷点）<textarea rows="2" style="width:100%">${esc(u.note)}</textarea></label>` +
+            `<label>活跃时段 HH:MM-HH:MM（留空=不限制）<input type="text" value="${esc(u.schedule)}" placeholder="21:30-23:30" style="width:120px"></label>` +
             `<button style="align-self:flex-start">保存</button>`;
           const [scoreI, noteI, schedI, btn] = [
             editor.querySelector('input'), editor.querySelector('textarea'),

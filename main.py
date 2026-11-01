@@ -42,10 +42,12 @@ from .core.vision import describe_image
 from .core.diagnostics import build_diagnostics
 from .core import diagnostics
 from .core import proactive
+from .core.proactive import (build_greeting, in_quiet_hours, memory_digest,
+                             pick_target)
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.2"
+PLUGIN_VERSION = "0.3.5"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
@@ -119,6 +121,29 @@ def _quote_reply_prefix(segments) -> str:
     return ""
 
 
+def _safe_int_id(value) -> int:
+    """平台 ID → int；非数字 ID（匿名/频道/第三方平台）返回 0。
+
+    qqmind 的记忆、账本、发送链路都按数字 QQ 号设计；遇到
+    32 位十六进制之类的平台 ID 时不能直接 int() 把 on_message
+    整个炸掉，边界处统一转 0，让调用方静默跳过这条事件。
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if 0 <= value < 2**63 else 0
+    s = str(value or "").strip()
+    if not s.isdigit():
+        if s:
+            logger.debug(f"[qqmind] non-numeric platform id ignored: {s[:64]!r}")
+        return 0
+    try:
+        v = int(s)
+    except ValueError:
+        return 0
+    return v if v < 2**63 else 0
+
+
 def _is_poke_self(segments, self_id: str) -> bool:
     """这条事件是不是「有人戳了机器人」。
 
@@ -156,10 +181,11 @@ _CONFIG_KEYS = (
     "reply_judge_enabled", "judge_scope", "reply_rate_per_min",
     "max_judged_per_min", "max_judged_per_round",
     "judge_model", "think_model",
+    "judge_no_think", "compress_no_think",
     "judge_fail_threshold", "bot_qq_ids", "allowed_groups",
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",
-    "followup_rounds", "history_rounds", "max_msg_tokens",
+    "followup_rounds", "max_msg_tokens",
     "group_reply_max_chars", "group_reply_detail_chars",
     "pool_trigger_msgs", "pool_max_msgs",
     "memory_prompt_budget",
@@ -204,7 +230,8 @@ class QQMindPlugin(star.Star):
         self._pub_diary = None                        # 公共群日记库（v0.3.0）
         self._flushing: dict[int, bool] = {}
         self.group_buffer = GroupBuffer(
-            max_len=int(self._cfg("group_buffer_size", 60)))
+            max_len=int(self._cfg("group_buffer_size", 60)),
+            max_item_tokens=int(self._cfg("max_msg_tokens", 100)))
         self.rate_limiter = RateLimiter(int(self._cfg("reply_rate_per_min", 6)))
         self.judge_limiter = RateLimiter(int(self._cfg("max_judged_per_min", 30)))
         self._runtime: dict[int, dict] = {}
@@ -217,12 +244,15 @@ class QQMindPlugin(star.Star):
         usage_dir = self._abs_dir("usage_dir", "qqmind_usage")
         self.budget = DailyBudget(os.path.join(usage_dir, "daily.json"), 0)
         self._hist_lock = asyncio.Lock()
+        self._aux_lock = asyncio.Lock()   # 非思考辅助 provider 懒创建锁
         self._ring = diagnostics.attach(logger)
         self._vision = VisionBudget(int(self._cfg("vision_budget", 50)))
         self._proactive = proactive.ProactiveState(
             int(self._cfg("proactive_per_day", 1)))
         self._proactive_task: asyncio.Task | None = None
         self._pool_sweep_task: asyncio.Task | None = None
+        self._bg_tasks: set[asyncio.Task] = set()   # create_task 强引用（防长任务被 GC 中断）
+        self._last_platform = ""      # 最近一次事件的平台前缀（诊断包用）
         # 巡检随插件启动（不是懒启动）：池对象懒加载+安静群没人发消息，
         # 懒启动会让磁盘上的存量池永远等不到巡检；同步构造（无事件循环）
         # 时退回第一条消息再启动
@@ -243,16 +273,10 @@ class QQMindPlugin(star.Star):
             return self.plugin_config.get(key, default)
         return default
 
-    def _data_dir(self) -> str:
-        import os
-        base = getattr(self.context, "get_data_dir", None)
-        try:
-            d = base() if callable(base) else "data"
-        except Exception:
-            d = "data"
-        return d if os.path.isabs(d) else os.path.join("data", "") and d
-
     def _abs_dir(self, key: str, default: str) -> str:
+        """配置目录 → 绝对路径。相对路径锚定 AstrBot 工作目录（CWD）：
+        历史数据一直落在这里，不能改锚 get_data_dir——那会让老用户的
+        日记/池子原地「消失」。"""
         import os
         d = str(self._cfg(key, default))
         if not os.path.isabs(d):
@@ -317,6 +341,67 @@ class QQMindPlugin(star.Star):
             self._pub_pool.max_msgs = mx
         return self._pub_pool
 
+    # ---------- 辅助任务 provider（v0.3.3） ----------
+    @staticmethod
+    def _is_deepseek_provider(provider) -> bool:
+        cfg = getattr(provider, "provider_config", {}) or {}
+        base = str(cfg.get("api_base") or cfg.get("base_url") or "")
+        model = str(cfg.get("model") or "")
+        return "deepseek" in base.lower() or model.lower().startswith("deepseek")
+
+    async def _aux_provider(self, kind: str):
+        """判读/压缩用的 provider：DeepSeek V4 默认思考，但这两类任务不需要。
+
+        - 判读只是三选一（是否对 AI 说话、是否要思考），思考链纯烧 output；
+        - 压缩只是把原文整理成 JSON，非思考模式足够。
+        做法：克隆当前 provider，在请求里强制 thinking=disabled；回复仍走
+        原 provider，判「是|思考」的当轮照常思考。
+        kind: "judge" | "compress"；对应配置 judge_no_think/compress_no_think。
+        """
+        base = self.context.get_using_provider()
+        if base is None:
+            return None
+        enabled = bool(self._cfg(f"{kind}_no_think", True))
+        if not enabled or not self._is_deepseek_provider(base):
+            return base
+        pm = getattr(self.context, "provider_manager", None)
+        if pm is None:
+            return base
+        clone_id = "qqmind-nothink"
+        inst_map = getattr(pm, "inst_map", {}) or {}
+        existing = inst_map.get(clone_id)
+        if existing is not None:
+            return existing
+        async with self._aux_lock:
+            existing = (getattr(pm, "inst_map", {}) or {}).get(clone_id)
+            if existing is not None:
+                return existing
+            cfg = dict(getattr(base, "provider_config", {}) or {})
+            if not cfg:
+                return base
+            cfg["id"] = clone_id
+            cfg["enable"] = True
+            raw_extra = cfg.get("custom_extra_body")
+            extra = dict(raw_extra) if isinstance(raw_extra, dict) else {}
+            extra["thinking"] = {"type": "disabled"}
+            cfg["custom_extra_body"] = extra
+            try:
+                lock = getattr(pm, "reload_lock", None)
+                if lock is not None:
+                    async with lock:
+                        await pm.load_provider(cfg)
+                else:
+                    await pm.load_provider(cfg)
+            except Exception as e:     # noqa: BLE001
+                logger.warning(
+                    f"[qqmind] non-thinking provider init failed: {e!r}")
+                return base
+            inst = (getattr(pm, "inst_map", {}) or {}).get(clone_id)
+            if inst is None:
+                return base
+            logger.info("[qqmind] judge/compress -> non-thinking provider clone")
+            return inst
+
     async def _flush_pool(self) -> bool:
         """池子攒满（或凌晨残余兜底）→ 一次模型调用拆成多篇话题日记。
 
@@ -334,7 +419,7 @@ class QQMindPlugin(star.Star):
             # max_msgs，整批塞进一次请求会撑爆上下文；剩下的留给下一批
             batch = pool.take_batch(pool.trigger_msgs)
             pool.save()
-            provider = self.context.get_using_provider()
+            provider = await self._aux_provider("compress")
             if provider is None:
                 pool.put_back(batch)
                 pool.save()
@@ -485,6 +570,14 @@ class QQMindPlugin(star.Star):
             p.budget = budget      # 控制台改预算热生效
         return p
 
+    def _spawn(self, coro) -> asyncio.Task:
+        """create_task 并持有强引用：事件循环只持弱引用，纯 fire-and-forget
+        的长任务（导入/池压缩）有被 GC 中断的风险（官方文档明确要求持有）。"""
+        t = asyncio.create_task(coro)
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+        return t
+
     def _ensure_pool_sweep(self) -> None:
         """残余兜底（v0.3.0）：每天凌晨 04:30 把不足一批的池底压一次。
 
@@ -624,7 +717,7 @@ class QQMindPlugin(star.Star):
         msg = str(self._cfg("quota_message", "") or "").strip()
         if not msg or not event.unified_msg_origin:
             return
-        asyncio.create_task(self._send_bubble(
+        self._spawn(self._send_bubble(
             gid, 0, msg, False, event.unified_msg_origin))
 
     def _is_bot(self, uid: int, event: AstrMessageEvent) -> bool:
@@ -690,7 +783,7 @@ class QQMindPlugin(star.Star):
         if task and not task.done():
             task.cancel()
         rt["batch_task"] = None
-        asyncio.create_task(self._flush_batch(gid))
+        self._spawn(self._flush_batch(gid))
 
     async def _batch_flush_later(self, gid: int) -> None:
         try:
@@ -727,8 +820,11 @@ class QQMindPlugin(star.Star):
                 logger.info(f"[qqmind] batch dropped (judge rate) in {gid}: "
                             f"{len(batch)} msgs")
                 return
+            # 攒批/随机读路径也要知道机器人在本群叫什么（判读提示词锚点），
+            # 否则按名字喊机器人的消息只能靠 @ 判定，准确率系统性偏低
+            bot_name = await self._bot_group_name_lazy(gid)
             ok, _ = await self._judge(gid, "", "", batch=batch,
-                                      bot_name=self._bot_names.get(int(gid), ""))
+                                      bot_name=bot_name)
             if not ok:
                 return
         if not self._allow_reply(gid):
@@ -772,7 +868,8 @@ class QQMindPlugin(star.Star):
         rt = self._rt(gid)
         bot = rt.get("bot")
         self_id = str(rt.get("self_id") or "")
-        if bot is None or not self_id or not hasattr(bot, "call_action"):
+        sid = _safe_int_id(self_id)
+        if bot is None or not sid or not hasattr(bot, "call_action"):
             # 通道缺失（OneBot 断连 / bot=None）：走 context 兜底
             try:
                 parts = ([At(qq=str(uid)), Plain(" " + text)] if first
@@ -788,7 +885,7 @@ class QQMindPlugin(star.Star):
             segs.append({"type": "at", "data": {"qq": str(uid)}})
         segs.append({"type": "text", "data": {"text": body}})
         try:
-            await bot.call_action("send_group_msg", self_id=int(self_id),
+            await bot.call_action("send_group_msg", self_id=sid,
                                   group_id=int(gid), message=segs)
             return True
         except Exception as e:
@@ -1046,10 +1143,7 @@ class QQMindPlugin(star.Star):
                              or "").strip()
             if configured == "":
                 return ""          # 显式清空 = 关
-            if configured:
-                global_src = configured
-            else:
-                global_src = ""
+            global_src = configured
         else:
             global_src = _LIVE_MODE_DEFAULT
         pack = str(self._cfg("persona_pack", "") or "").strip()
@@ -1096,7 +1190,7 @@ class QQMindPlugin(star.Star):
                              m.get("nick") or "", m.get("content") or ""))
             pool.save()
             if pool.should_flush():
-                asyncio.create_task(self._flush_pool())
+                self._spawn(self._flush_pool())
         gm.save()
 
     def _persist_group(self, gid: int, uid: int,
@@ -1111,7 +1205,7 @@ class QQMindPlugin(star.Star):
             gm.add_precise_round(uid, user_text, reply)
             over = gm.take_precise_overflow(uid)
             if over:
-                asyncio.create_task(
+                self._spawn(
                     self._compress_or_restore(gid, over, [str(uid)], uid))
         else:
             gm.add_assistant(reply)
@@ -1128,13 +1222,13 @@ class QQMindPlugin(star.Star):
                                  m.get("nick") or "", m.get("content") or ""))
                 pool.save()
                 if pool.should_flush():
-                    asyncio.create_task(self._flush_pool())
+                    self._spawn(self._flush_pool())
         gm.save()
 
     async def _compress_or_restore(self, gid: int, msgs: list[dict],
                                    tags_extra=None, precise_uid=None) -> None:
         """压进群日记；失败把原文放回窗口，下轮再试（不丢记忆）。"""
-        provider = self.context.get_using_provider()
+        provider = await self._aux_provider("compress")
         gm = self._group_mem(gid)
         used = 0
         if provider is not None:
@@ -1251,10 +1345,11 @@ class QQMindPlugin(star.Star):
         rt = self._rt(gid)
         bot = rt.get("bot")
         self_id = str(rt.get("self_id") or "")
-        if bot is None or not self_id or not hasattr(bot, "call_action"):
+        sid = _safe_int_id(self_id)
+        if bot is None or not sid or not hasattr(bot, "call_action"):
             return
         try:
-            await bot.call_action("send_group_poke", self_id=int(self_id),
+            await bot.call_action("send_group_poke", self_id=sid,
                                   group_id=int(gid), user_id=int(uid))
         except Exception as e:
             logger.debug(f"[qqmind] poke back failed: {e!r}")
@@ -1266,7 +1361,11 @@ class QQMindPlugin(star.Star):
         只拦主模型，不终结事件链——其他插件和命令照常处理。"""
         # 判读门只管群聊；私聊直接放行给挂点 2/3 处理
         if event.is_private_chat():
-            puid = int(event.get_sender_id() or 0)
+            try:
+                self._last_platform = event.get_platform_name() or self._last_platform
+            except Exception:
+                pass
+            puid = _safe_int_id(event.get_sender_id())
             if puid:
                 # 记住最近一次私聊 origin（主动私信的发送地址）；
                 # 用户回了话 → 主动私信未回应计数清零
@@ -1275,8 +1374,12 @@ class QQMindPlugin(star.Star):
                     "last_msg": time.time()}
                 self._proactive_reply_watch(puid)
             return
-        gid = int(event.get_group_id() or 0)
-        uid = int(event.get_sender_id() or 0)
+        gid = _safe_int_id(event.get_group_id())
+        uid = _safe_int_id(event.get_sender_id())
+        try:
+            self._last_platform = event.get_platform_name() or self._last_platform
+        except Exception:
+            pass
         self_id = str(event.get_self_id() or "")
         if not gid or not uid or str(uid) == self_id:
             return
@@ -1486,7 +1589,7 @@ class QQMindPlugin(star.Star):
         """浅层判读。batch 非空时整批判一次；出错 fail-closed。"""
         if self._budget_exhausted():
             return False, False
-        provider = self.context.get_using_provider()
+        provider = await self._aux_provider("judge")
         if provider is None:
             return False, False
         k = len(batch) if batch else 1
@@ -1495,8 +1598,15 @@ class QQMindPlugin(star.Star):
         # 待判消息与缓冲同格式（nick(uid)：内容）。注意 on_message 入队时
         # nick 已含 (uid)，这里不再包一层（v0.2.15 审查修：否则变成
         # 张三(111)(111)，判读门认不出同一个人）
-        pending = ("\n".join(f"{m['nick']}: {m['text']}" for m in batch)
-                   if batch else f"{nick}：{text}")
+        # 单条超长截断（v0.3.5）：判读只需判断「是否在对 AI 说话」，
+        # 4000 字原文整段进提示词纯烧钱，与群缓冲 max_msg_tokens 同口径
+        _cap_n = max(16, int(self._cfg("max_msg_tokens", 100))) * 2
+
+        def _cap(s: str) -> str:
+            return s if len(s) <= _cap_n else s[:_cap_n].rstrip() + "…"
+
+        pending = ("\n".join(f"{m['nick']}: {_cap(m['text'])}" for m in batch)
+                   if batch else f"{nick}：{_cap(text)}")
         question = ("以上这些消息是在对AI助手说话吗？若在，需要AI深度思考吗？"
                     if batch else
                     "这条消息是在对AI助手说话吗？若在，需要AI深度思考吗？")
@@ -1567,11 +1677,12 @@ class QQMindPlugin(star.Star):
         name = ""
         me = str(event.get_self_id() or "")
         bot = getattr(event, "bot", None)
-        if bot is not None and me:
+        me_i, gid_i = _safe_int_id(me), _safe_int_id(gid)
+        if bot is not None and me_i and gid_i:
             try:
                 info = await bot.call_action(
-                    "get_group_member_info", self_id=int(me),
-                    group_id=int(gid), user_id=int(me))
+                    "get_group_member_info", self_id=me_i,
+                    group_id=gid_i, user_id=me_i)
                 if isinstance(info, dict):
                     name = (info.get("card") or info.get("nickname") or "").strip()
             except Exception as e:
@@ -1588,10 +1699,33 @@ class QQMindPlugin(star.Star):
         self._bot_names[gid] = name
         return name
 
+    async def _bot_group_name_lazy(self, gid: int) -> str:
+        """攒批/随机读路径的群名片：没有事件对象，从运行时存的 bot/self_id
+        懒查一次并缓存。查不到缓存空值，不会每批都打 API。"""
+        if gid in self._bot_names:
+            return self._bot_names[gid]
+        rt = self._rt(gid)
+        me = str(rt.get("self_id") or "")
+        bot = rt.get("bot")
+        if not me or bot is None or not hasattr(bot, "call_action"):
+            return ""
+        name = ""
+        me_i, gid_i = _safe_int_id(me), _safe_int_id(gid)
+        try:
+            info = await bot.call_action(
+                "get_group_member_info", self_id=me_i,
+                group_id=gid_i, user_id=me_i)
+            if isinstance(info, dict):
+                name = (info.get("card") or info.get("nickname") or "").strip()
+        except Exception as e:
+            logger.debug(f"[qqmind] lazy member info lookup failed: {e!r}")
+        self._bot_names[gid] = name
+        return name
+
     # ---------- 挂点 2：LLM 请求前（记忆注入） ----------
     @on_llm_request()
     async def inject_memory(self, event: AstrMessageEvent, req: ProviderRequest):
-        uid = int(event.get_sender_id() or 0)
+        uid = _safe_int_id(event.get_sender_id())
         if not uid:
             return
         if event.is_private_chat():
@@ -1616,7 +1750,9 @@ class QQMindPlugin(star.Star):
             req.contexts = [{"role": m["role"], "content": m["content"]}
                             for m in p.messages]
             return
-        gid = int(event.get_group_id() or 0)
+        gid = _safe_int_id(event.get_group_id())
+        if not gid:
+            return
         gnick = (event.get_sender_name() or "").strip() or str(uid)
         # 原生管线的用户消息也可能带引用——主模型必须看得见被引用的那句
         gtext = event.message_str or ""
@@ -1801,11 +1937,13 @@ class QQMindPlugin(star.Star):
     async def _resolve_recall(self, event: AstrMessageEvent, resp,
                               reply: str) -> str:
         """原生管线挂点：解析回捞标记并写回 resp.completion_text。"""
-        uid = int(event.get_sender_id() or 0)
+        uid = _safe_int_id(event.get_sender_id())
         scope = "private" if event.is_private_chat() else "group"
-        gid = int(event.get_group_id() or 0)
+        gid = _safe_int_id(event.get_group_id())
         new_reply = await self._recall_reply(reply, scope, uid, gid)
         if scope == "group":
+            if not gid:
+                return reply
             # 群聊硬截断（v0.2.4）：AstrBot 渲染按 \n 分段发送，提示词压不住的
             # 长回复在这里按字符预算兜底（私有聊不限——日记问答允许展开说）。
             # v0.2.10：讲题/教程场景放宽上限——80 一刀切曾把数学推导腰斩。
@@ -1848,20 +1986,21 @@ class QQMindPlugin(star.Star):
     # ---------- 挂点 3：LLM 回复后（落盘/压缩/额度刷新） ----------
     @on_llm_response()
     async def persist_round(self, event: AstrMessageEvent, resp):
-        uid = int(event.get_sender_id() or 0)
+        uid = _safe_int_id(event.get_sender_id())
         reply = (getattr(resp, "completion_text", "") or "").strip()
         if not uid or not reply:
             return
+        is_private = event.is_private_chat()
+        gid = 0 if is_private else _safe_int_id(event.get_group_id())
+        if not is_private and not gid:
+            return
         self._real_usage(resp, "reply")
         self._count_usage(event.message_str or "", reply, resp=resp,
-                          gid=(int(event.get_group_id() or 0)
-                               if not event.is_private_chat() else 0))
+                          gid=gid)
         reply = await self._resolve_recall(event, resp, reply)
         if not reply:
             return
-        self._stat("replied",
-                   int(event.get_group_id() or 0)
-                   if not event.is_private_chat() else None)
+        self._stat("replied", gid if not is_private else None)
         if self._cfg("affinity_enabled", False):
             self._affection.add(uid, 1)
         text = (event.message_str or "").strip()
@@ -1876,9 +2015,9 @@ class QQMindPlugin(star.Star):
                 p.save_window()                        # v0.3.2：重启不失忆
                 need = p.over_budget()
             if need:
-                asyncio.create_task(self._compress_private(p))
+                self._spawn(self._compress_private(p))
         else:
-            gid = int(event.get_group_id() or 0)
+            gid = _safe_int_id(event.get_group_id())
             key = (gid, uid)
             nick = (event.get_sender_name() or "").strip() or str(uid)
             cap = int(self._cfg("max_msg_tokens", 100))
@@ -1894,7 +2033,7 @@ class QQMindPlugin(star.Star):
                 s.touch()
 
     async def _compress_private(self, p: PrivateSession):
-        provider = self.context.get_using_provider()
+        provider = await self._aux_provider("compress")
         if provider is None:
             return
         for _ in range(3):
@@ -1924,6 +2063,20 @@ class QQMindPlugin(star.Star):
             pass
 
     async def _proactive_tick(self) -> None:
+        # 未回应冷却（v0.3.5 接线）：主动消息发出 24h 没人理 → 记一次，
+        # 攒满 no_reply_limit 次 → 该用户冷却 7 天。之前这逻辑只有
+        # mark_no_reply 方法、没有调用方，护栏形同虚设。
+        limit = int(self._cfg("proactive_no_reply_limit", 3))
+        if limit > 0:
+            for uid, p in self.privates.items():
+                pro_ts = 0.0
+                user_ts = 0.0
+                for m in p.messages:
+                    if m.get("proactive"):
+                        pro_ts = max(pro_ts, float(m.get("ts") or 0))
+                    elif m.get("role") == "user":
+                        user_ts = max(user_ts, float(m.get("ts") or 0))
+                self._proactive.sweep_no_reply(uid, pro_ts, user_ts, limit)
         affinity_on = self._cfg("affinity_enabled", False)
         friends = [str(x) for x in (self._cfg("proactive_friends") or [])]
         if affinity_on:
@@ -1971,7 +2124,7 @@ class QQMindPlugin(star.Star):
         greeting = await build_greeting(provider, bot_name, str(uid), digest)
         if not greeting:
             return
-        origin = f"snowluma:FriendMessage:{uid}"
+        origin = f"qqmind:friend:{uid}"
         # 平台前缀按实际平台适配器生成——从已知私聊事件里取真实 origin 更稳
         origin = self._latest_private_origin(uid) or origin
         try:
@@ -2023,6 +2176,13 @@ class QQMindPlugin(star.Star):
             self._pub_diary.close()
             self._pub_diary = None
         self._pub_pool = None
+        # v0.3.3：非思考辅助 provider 是本插件私有的运行时克隆，卸载时一并释放
+        pm = getattr(self.context, "provider_manager", None)
+        if pm is not None:
+            try:
+                await pm.terminate_provider("qqmind-nothink")
+            except Exception as e:     # noqa: BLE001
+                logger.debug(f"[qqmind] aux provider cleanup failed: {e!r}")
         for cs in self._chapters.values():
             cs.close()
         self._chapters.clear()
@@ -2138,7 +2298,7 @@ class QQMindPlugin(star.Star):
             """
             payload = await _web_request.json(default={}) or {}
             source = str(payload.get("source") or "").strip()
-            uid = int(payload.get("uid") or 0)
+            uid = _safe_int_id(payload.get("uid"))
             if uid <= 0:
                 return {"status": "error", "message": "缺少 uid（导入到谁）"}
             from .core.importer import (chunk_messages, extract_conversations_json,
@@ -2152,7 +2312,8 @@ class QQMindPlugin(star.Star):
 
                 async def _run_and_persist():
                     await run_import(job, diary,
-                                     self.context.get_using_provider())
+                                     self.context.get_using_provider(),
+                                     budget=self.budget)
                     if job.profile:
                         try:
                             diary.save_profile(job.profile)
@@ -2161,7 +2322,7 @@ class QQMindPlugin(star.Star):
                         except Exception as e:     # noqa: BLE001
                             logger.warning(f"[qqmind] profile save failed: {e!r}")
 
-                asyncio.create_task(_run_and_persist())
+                self._spawn(_run_and_persist())
                 logger.info(f"[qqmind] import {import_id} started: uid={uid} "
                             f"src={label} msgs={len(msgs)} "
                             f"chunks={job.total_chunks}")
@@ -2246,7 +2407,7 @@ class QQMindPlugin(star.Star):
         async def api_affection_update():
             """编辑某用户好感度：note（备注）/schedule（作息）/score（手调）。"""
             payload = await _web_request.json(default={}) or {}
-            uid = int(payload.get("uid") or 0)
+            uid = _safe_int_id(payload.get("uid"))
             if uid <= 0:
                 return {"status": "error", "message": "缺少 uid"}
             if "note" in payload:
@@ -2273,7 +2434,10 @@ class QQMindPlugin(star.Star):
             import time as _t
             uid = str(_web_request.query.get("uid") or "").strip()
             if uid:
-                p = self._private(int(uid))
+                uid_int = _safe_int_id(uid)
+                if uid_int <= 0:
+                    return {"status": "ok", "data": {"entries": []}}
+                p = self._private(uid_int)
             elif self.privates:
                 latest_uid = max(self.privates,
                                  key=lambda u: self.privates[u].diary.count())
@@ -2446,7 +2610,7 @@ class QQMindPlugin(star.Star):
         return build_diagnostics(
             plugin_version=PLUGIN_VERSION,
             astrbot_version=ab_ver,
-            platform="aiocqhttp",
+            platform=self._last_platform or "unknown",
             provider_model=model,
             config={k: self._cfg(k) for k in diagnostics.DIAG_CONFIG_KEYS
                     if k != "allowed_groups_count"},
@@ -2459,7 +2623,7 @@ class QQMindPlugin(star.Star):
     @filter.command("qqmind")
     async def cmd_qqmind(self, event: AstrMessageEvent):
         """查看插件状态与记忆账本。带「诊断」参数时输出排障摘要。"""
-        uid = int(event.get_sender_id() or 0)
+        uid = _safe_int_id(event.get_sender_id())
         arg = (event.message_str or "").strip()
         if arg in ("诊断", "diag", "诊断包"):
             d = self._diagnostics_snapshot()
@@ -2509,7 +2673,7 @@ class QQMindPlugin(star.Star):
             gid = None
             scope_line = "全网总量"
         else:
-            gid = int(event.get_group_id() or 0)
+            gid = _safe_int_id(event.get_group_id())
             scope_line = "本群"
         s = self._stats_for(gid)
         b = self._budget().snapshot()
@@ -2532,7 +2696,9 @@ class QQMindPlugin(star.Star):
                 f"🐋 今日账单（{b['day']}·全网）：读 {s['judged']} 条"
                 f" · 回 {s['replied']} 条 · 用了 {b['used']} token")
             return
-        gid = int(event.get_group_id() or 0)
+        gid = _safe_int_id(event.get_group_id())
+        if not gid:
+            return
         g = self._stats_for(gid)
         g_tok = b.get("per_group", {}).get(gid, 0)
         yield event.plain_result(
@@ -2544,9 +2710,11 @@ class QQMindPlugin(star.Star):
     @filter.command("日记")
     async def cmd_diary(self, event: AstrMessageEvent):
         """翻日记：/日记 最近 或 /日记 关键词 或 /日记 昨天 或 /日记 #3 看全文"""
-        uid = int(event.get_sender_id() or 0)
+        uid = _safe_int_id(event.get_sender_id())
         if not event.is_private_chat():
             yield event.plain_result("日记是私聊的记忆，私聊我再看哦")
+            return
+        if not uid:
             return
         p = self._private(uid)
         arg = (event.message_str or "").strip()
@@ -2568,7 +2736,9 @@ class QQMindPlugin(star.Star):
         if event.is_private_chat():
             yield event.plain_result("群日记要在群里看哦，私聊找我看 /日记～")
             return
-        gid = int(event.get_group_id() or 0)
+        gid = _safe_int_id(event.get_group_id())
+        if not gid:
+            return
         allowed = self._cfg("allowed_groups") or []
         if allowed and str(gid) not in [str(g) for g in allowed]:
             yield event.plain_result("这个群没有开通我的记忆功能～")

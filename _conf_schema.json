@@ -101,6 +101,18 @@
     "default": "",
     "hint": "如 deepseek-reasoner；主模型名以 -nothink 结尾时自动去掉后缀"
   },
+  "judge_no_think": {
+    "description": "判读使用非思考模式（DeepSeek provider 自动创建非思考副本）",
+    "type": "bool",
+    "default": true,
+    "hint": "判读只做三选一，思考链纯浪费；回复的思考模式仍由判读结果决定，不受影响"
+  },
+  "compress_no_think": {
+    "description": "群/私聊压缩使用非思考模式（DeepSeek provider 自动创建非思考副本）",
+    "type": "bool",
+    "default": true,
+    "hint": "压缩只是把原文整理成 JSON；若发现日记质量下降可关掉"
+  },
   "reply_judge_enabled": {
     "description": "判读门：读到的消息先判是否在对机器人说",
     "type": "bool",
@@ -215,7 +227,7 @@
     "hint": "风控敏感：建议 ≤2"
   },
   "proactive_no_reply_limit": {
-    "description": "连续几次没回应后冷却该用户 7 天",
+    "description": "连续几次没回应后冷却该用户 7 天（0=关闭该护栏）",
     "type": "int",
     "default": 3
   },
@@ -283,13 +295,8 @@
     "type": "int",
     "default": 12
   },
-  "history_rounds": {
-    "description": "群聊逐字窗口轮数（1 轮=用户+回复）",
-    "type": "int",
-    "default": 110
-  },
   "max_msg_tokens": {
-    "description": "群聊单条消息入史门槛（超长照回复但不入窗口）",
+    "description": "单条消息 token 上限（超长截断后入窗口/判读语境/候选池）",
     "type": "int",
     "default": 100
   },
@@ -303,11 +310,6 @@
     "description": "日记库目录（每用户一个 SQLite，相对 AstrBot 数据目录）",
     "type": "string",
     "default": "qqmind_diaries"
-  },
-  "history_dir": {
-    "description": "群聊历史目录（相对 AstrBot 数据目录）",
-    "type": "string",
-    "default": "qqmind_history"
   },
   "diary_headers_in_prompt": {
     "description": "系统提示词里带的日记标题行条数（时间+标题，让模型知道自己记过哪些事）",

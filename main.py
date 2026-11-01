@@ -1592,9 +1592,10 @@ class QQMindPlugin(star.Star):
         provider = await self._aux_provider("judge")
         if provider is None:
             return False, False
-        k = len(batch) if batch else 1
-        ctx_all = self.group_buffer.recent(gid, 7 + k)
-        ctx_lines = ctx_all[:-k][-7:] if len(ctx_all) >= k else []
+        # 判读不带群聊语境（v0.3.5 账单实测：语境占单次输入 ~40%，且群越活
+        # 跃越缓存不命中；98.6% 的判读结论是「否」，为「不用回」带 7 条原文
+        # 纯属烧钱）。判读只是分类器——「这句是不是在跟 AI 说话」靠待判
+        # 消息本身+群名片锚点足够；回复路径的 7 条语境不受影响。
         # 待判消息与缓冲同格式（nick(uid)：内容）。注意 on_message 入队时
         # nick 已含 (uid)，这里不再包一层（v0.2.15 审查修：否则变成
         # 张三(111)(111)，判读门认不出同一个人）
@@ -1611,11 +1612,7 @@ class QQMindPlugin(star.Star):
                     if batch else
                     "这条消息是在对AI助手说话吗？若在，需要AI深度思考吗？")
         who = f"AI助手在本群的名字是「{bot_name}」。\n" if bot_name else ""
-        if ctx_lines:
-            ask = (who + "【最近群聊记录】\n" + "\n".join(ctx_lines)
-                   + f"\n【待判断消息】\n{pending}\n{question}")
-        else:
-            ask = who + f"【待判断消息】\n{pending}\n{question}"
+        ask = who + f"【待判断消息】\n{pending}\n{question}"
         logger.debug(f"[qqmind] judge ask: {ask[:260]!r}")
         judge_model = str(self._cfg("judge_model", "") or "").strip()
         try:

@@ -184,7 +184,7 @@ _CONFIG_KEYS = (
     "judge_no_think", "compress_no_think",
     "judge_fail_threshold", "bot_qq_ids", "allowed_groups",
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
-    "reply_context_messages",
+    "reply_context_messages", "judge_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",
     "followup_rounds", "max_msg_tokens",
     "group_reply_max_chars", "group_reply_detail_chars",
@@ -993,16 +993,27 @@ class QQMindPlugin(star.Star):
 
     def _group_contexts(self, gid: int, uid: int,
                         skip_last: int = 0) -> list[dict]:
+        """回复的逐字 contexts（档位定案 2026-11-01 拨乱反正）：
+
+        - 精确记忆：该用户记忆线（与档位无关）
+        - 轻量：[]（轻量只回 @，语境靠 system tail 的 20 条）
+        - 全量：group_flat_messages 条（原定义：平铺不分层）
+        - 分层：group_shallow_messages 条浅层（原定义：浅层+深层日记）
+        - 高级：reply_context_messages 自选（高级=暴露轴，默认 0 省）
+        """
         mode = self._memory_mode()
+        preset = normalize_preset(self._cfg("group_preset", "light"))
         if mode == "precise":
             return self._group_mem(gid).precise_context(uid)
         if self._is_light():
             return []
-        # 回复附带条数可控（v0.3.5 账单驱动）：0=不带群聊语境。
-        # 默认 0：上下文在群聊场景主要靠 system 提示词里的浅层窗口
-        # （group_context_messages / 精确记忆线），flat/layered 的逐字
-        # contexts 是叠加的第二份语境，群活跃时 token 翻倍烧。
-        limit = int(self._cfg("reply_context_messages", 0))
+        if preset == "advanced":
+            limit = int(self._cfg("reply_context_messages", 0))
+        else:
+            # 全量/分层按各自定义恢复；配置填 0 也可关
+            limit = (int(self._cfg("group_flat_messages", 60))
+                     if mode == "flat"
+                     else int(self._cfg("group_shallow_messages", 20)))
         if limit <= 0:
             return []
         return self._group_mem(gid).flat_context(limit, skip_last=skip_last)
@@ -1597,10 +1608,11 @@ class QQMindPlugin(star.Star):
         provider = await self._aux_provider("judge")
         if provider is None:
             return False, False
-        # 判读不带群聊语境（v0.3.5 账单实测：语境占单次输入 ~40%，且群越活
-        # 跃越缓存不命中；98.6% 的判读结论是「否」，为「不用回」带 7 条原文
-        # 纯属烧钱）。判读只是分类器——「这句是不是在跟 AI 说话」靠待判
-        # 消息本身+群名片锚点足够；回复路径的 7 条语境不受影响。
+        k = len(batch) if batch else 1
+        # 判读语境条数可控（v0.3.5 账单实测：7 条语境占单次输入 ~40%，
+        # 群越活跃缓存越不命中；98.6% 的判读结论是「否」，为「不用回」带
+        # 7 条原文纯属烧钱）。默认 0=只判待判消息本身+群名片锚点；
+        # 想恢复旧行为填 7。判读语境从 group_buffer 出（写侧在 on_message）。
         # 待判消息与缓冲同格式（nick(uid)：内容）。注意 on_message 入队时
         # nick 已含 (uid)，这里不再包一层（v0.2.15 审查修：否则变成
         # 张三(111)(111)，判读门认不出同一个人）
@@ -1617,7 +1629,16 @@ class QQMindPlugin(star.Star):
                     if batch else
                     "这条消息是在对AI助手说话吗？若在，需要AI深度思考吗？")
         who = f"AI助手在本群的名字是「{bot_name}」。\n" if bot_name else ""
-        ask = who + f"【待判断消息】\n{pending}\n{question}"
+        n_jctx = int(self._cfg("judge_context_messages", 0))
+        ctx_lines = []
+        if n_jctx > 0:
+            ctx_all = self.group_buffer.recent(gid, n_jctx + k)
+            ctx_lines = ctx_all[:-k][-n_jctx:] if len(ctx_all) >= k else []
+        if ctx_lines:
+            ask = (who + "【最近群聊记录】\n" + "\n".join(ctx_lines)
+                   + f"\n【待判断消息】\n{pending}\n{question}")
+        else:
+            ask = who + f"【待判断消息】\n{pending}\n{question}"
         logger.debug(f"[qqmind] judge ask: {ask[:260]!r}")
         judge_model = str(self._cfg("judge_model", "") or "").strip()
         try:
@@ -1662,7 +1683,6 @@ class QQMindPlugin(star.Star):
         # 账单唯一计账点（v0.2.3）：读/拦只在判读出口记，三条调用路径
         # （全量/监控期/攒批）自动统一——攒批此前整条路径漏计，账单「读」严重偏小。
         # 读=k 条（整批判读看了 k 条）；拦=1 次回复决策（整批判否也只省一次回复）
-        k = len(batch) if batch else 1
         self._STATS["judge_in"] += est_tokens(ask) + JUDGE_PROMPT_LEN
         self._STATS["judge_out"] += est_tokens(out_text)
         self._stat("judged", gid, k)

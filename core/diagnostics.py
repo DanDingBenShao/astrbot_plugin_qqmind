@@ -106,6 +106,7 @@ DIAG_CONFIG_KEYS = (
     "daily_token_budget", "batch_max_messages", "debounce_seconds",
     "followup_rounds", "roam_enabled", "memory_layering", "precise_memory",
     "precise_budget_tokens", "group_flat_messages", "group_shallow_messages",
-    "group_context_messages", "group_buffer_size",
+    "group_context_messages", "reply_context_messages",
+    "judge_context_messages", "group_buffer_size",
     "allowed_groups_count",
 )

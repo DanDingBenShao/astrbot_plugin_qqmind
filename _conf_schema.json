@@ -27,12 +27,13 @@
     "hint": "纯内存，不花 API 钱；重启清零"
   },
   "group_flat_messages": {
-    "description": "全量模式平铺进上下文的群消息条数",
+    "description": "全量模式回复带的逐字群消息条数（平铺不分层，原定义）",
     "type": "int",
-    "default": 60
+    "default": 60,
+    "hint": "填 0 可关（省 token，但全量档就没有逐字语境了）"
   },
   "group_shallow_messages": {
-    "description": "分层模式浅层原文条数（超出部分压成群日记）",
+    "description": "分层模式浅层原文条数（超出部分压成群日记，原定义）",
     "type": "int",
     "default": 20
   },
@@ -42,10 +43,16 @@
     "default": 20
   },
   "reply_context_messages": {
-    "description": "全量/分层模式回复时逐字 contexts 附带条数（0=不带，默认）",
+    "description": "高级档：回复逐字 contexts 条数（高级=轴自选；0=不带，默认）",
     "type": "int",
     "default": 0,
-    "hint": "语境已在 system 提示词的浅层窗口里，这里是叠加的第二份逐字原文；群活跃时开着 token 翻倍烧。想要旧行为：全量填 60、分层填 20"
+    "hint": "只对高级档生效；全量/分层档由上面两个键各管各的。填了之后语境走逐字原文（与浅层 system 窗口叠加，群活跃时 token 翻倍烧）"
+  },
+  "judge_context_messages": {
+    "description": "判读带最近群消息条数（0=不带，默认）",
+    "type": "int",
+    "default": 0,
+    "hint": "账单实测 7 条语境占判读输入 40% 且活跃群缓存必失效（98.6% 判否）；默认只判待判消息+群名片锚点。想要旧行为填 7"
   },
   "memory_layering": {
     "description": "高级档开关A：记忆分层（浅层原文 + 深层群日记）",

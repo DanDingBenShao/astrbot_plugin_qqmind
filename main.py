@@ -28,6 +28,7 @@ from astrbot.api.event.filter import on_llm_request, on_llm_response
 from astrbot.api.message_components import At, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.web import request as _web_request
+from astrbot.core.agent.message import TextPart   # 官方推荐的动态上下文部件
 
 from .core import (JUDGE_PROMPT, MAX_JUDGED_PER_ROUND, ChapterStore,
                    AffectionStore, CandidatePool, DailyBudget, GroupBuffer,
@@ -48,7 +49,7 @@ from .core.proactive import (build_greeting, in_quiet_hours, memory_digest,
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.6"
+PLUGIN_VERSION = "0.3.7"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 # 数据根：官方规定 data/plugin_data/<插件名>（市场规范 2026-11-01 整改）。
@@ -261,7 +262,7 @@ class QQMindPlugin(star.Star):
         self.budget = DailyBudget(os.path.join(usage_dir, "daily.json"), 0)
         self._hist_lock = asyncio.Lock()
         self._aux_lock = asyncio.Lock()   # 非思考辅助 provider 懒创建锁
-        self._ring = diagnostics.attach(logger)
+        self._ring = diagnostics.attach()   # loguru sink（v0.3.7：不 import logging）
         self._vision = VisionBudget(int(self._cfg("vision_budget", 50)))
         self._proactive = proactive.ProactiveState(
             int(self._cfg("proactive_per_day", 1)))
@@ -1821,12 +1822,13 @@ class QQMindPlugin(star.Star):
                     profile = (profile + "\n【用户可能在问过去的事；下面是从日记"
                                "预检索到的结果，够答就直接答，不够再输出 "
                                "<查日记\"关键词\">】\n" + found).strip()
+            # v0.3.7 市场整改：动态段（人设+日记预检索+窗口摘要）走官方
+            # extra_user_content_parts（.mark_as_temp 只在本轮生效不落历史），
+            # stable 人设骨架留 system_prompt；contexts 不再整体替换——
+            # 官方会话历史照常携带，压缩预算照旧在本插件窗口上跑。
             if profile:
-                req.system_prompt = (profile + "\n"
-                                     + (req.system_prompt or "")).strip()
-            # 用我们自己的窗口替换 AstrBot 自带历史（避免双份 token）
-            req.contexts = [{"role": m["role"], "content": m["content"]}
-                            for m in p.messages]
+                req.extra_user_content_parts.append(
+                    TextPart(text=profile).mark_as_temp())
             return
         gid = _safe_int_id(event.get_group_id())
         if not gid:
@@ -1848,11 +1850,13 @@ class QQMindPlugin(star.Star):
         # 用户消息本体带引用前缀，模型才知道"他引用着那句话在说这个"
         if quote:
             req.prompt = f"{quote}{(req.prompt or '').strip()}".strip()
-        # 好感度备注/作息（v0.2.8）：群聊回复对当前说话人生效
+        # 好感度备注/作息（v0.2.8）：群聊回复对当前说话人生效——每轮变化，
+        # v0.3.7 改走官方 extra_user_content_parts（不进 system_prompt 护缓存）
         if self._cfg("affinity_enabled", False):
             aff_line = profile_to_prompt(self._affection.get(uid))
             if aff_line:
-                profile = (profile + "\n" + aff_line).strip()
+                req.extra_user_content_parts.append(
+                    TextPart(text=aff_line).mark_as_temp())
         if profile:
             req.system_prompt = (profile + "\n"
                                  + (req.system_prompt or "")).strip()
@@ -2271,7 +2275,7 @@ class QQMindPlugin(star.Star):
             cs.close()
         self._chapters.clear()
         if getattr(self, "_ring", None):
-            diagnostics.detach(logger, self._ring)
+            diagnostics.detach(self._ring)
             self._ring = None
 
     # ---------- 配置页后端 API（views/console 通过面板桥调用） ----------

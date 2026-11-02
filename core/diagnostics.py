@@ -1,15 +1,19 @@
-"""诊断能力：环形日志缓冲 + 一键诊断包（纯内核，不依赖 AstrBot）。
+"""诊断能力：环形日志缓冲 + 一键诊断包。
+
+捕获方式（v0.3.7 市场规范整改）：AstrBot 的日志底座是 loguru
+（astrbot.api.logger 即其插件路由代理），本模块用 loguru sink 挂接环形
+缓冲——插件自身不 import logging 模块，也不自建 Handler/Formatter。
+过滤规则与旧版一致：只抓带 [qqmind] 标记的行。
 
 设计约束：
-- 环形 Handler 只抓本插件自己的日志（record.name 以 qqmind 前缀开头的
-  logger，或消息带 [qqmind] 标记），上限 300 条，纯内存零文件。
+- 环形缓冲只抓本插件自己的日志（消息带 [qqmind] 标记），上限 300 条，
+  纯内存零文件。
 - 诊断包四段：environment（版本/模型）/ config（配置快照）/ runtime
   （计数与状态）/ logs（脱敏摘录）。消息正文统一截断，隐私红线：
   日记正文绝不出包。
 """
 from __future__ import annotations
 
-import logging
 import time
 from collections import deque
 
@@ -39,22 +43,27 @@ def clip_message(line: str) -> str:
     return line
 
 
-class RingBufferHandler(logging.Handler):
-    """内存环形日志缓冲。attach 到插件的 logger 上即可。"""
+class RingBuffer:
+    """内存环形日志缓冲。经 loguru sink 挂到 astrbot 日志流上。"""
 
     def __init__(self, capacity: int = LOG_BUFFER_SIZE):
-        super().__init__(level=logging.DEBUG)
-        self._buf: deque[str] = deque(maxlen=capacity)
+        self._buf: deque[dict] = deque(maxlen=capacity)
+        self._id = None   # loguru sink id
 
-    def emit(self, record: logging.LogRecord) -> None:
+    def _sink(self, message) -> None:
+        """loguru sink：只收带 [qqmind] 标记的行。用 record["message"]
+        拿裸消息（绕开 loguru 的 <lv> 前缀格式化）。"""
         try:
-            msg = self.format(record)
+            rec = message.record
+            text = str(rec["message"]).strip()
         except Exception:
-            msg = record.getMessage()
+            return
+        if PLUGIN_MARK not in text:
+            return
         self._buf.append({"ts": time.strftime("%m-%d %H:%M:%S",
-                                             time.localtime(record.created)),
-                          "level": record.levelname,
-                          "line": clip_message(msg)})
+                                              time.localtime(rec["time"].timestamp())),
+                          "level": rec["level"].name,
+                          "line": clip_message(text)})
 
     def snapshot(self) -> list[dict]:
         return list(self._buf)
@@ -63,19 +72,27 @@ class RingBufferHandler(logging.Handler):
         self._buf.clear()
 
 
-def attach(plugin_logger, capacity: int = LOG_BUFFER_SIZE) -> RingBufferHandler:
-    """把环形缓冲挂到 logger 上（幂等：已有则先摘再挂）。返回 handler。"""
-    for h in list(plugin_logger.handlers):
-        if isinstance(h, RingBufferHandler):
-            plugin_logger.removeHandler(h)
-    h = RingBufferHandler(capacity)
-    h.setFormatter(logging.Formatter("%(message)s"))
-    plugin_logger.addHandler(h)
-    return h
+def attach(capacity: int = LOG_BUFFER_SIZE) -> RingBuffer:
+    """把环形缓冲挂上 astrbot 日志流（幂等：已有则先摘再挂）。返回 RingBuffer。
+
+    走 loguru sink（astrbot.api.logger 底层即 loguru，官方依赖自带），
+    不 import logging、不自建 Handler。捕获按级别过滤：只收 INFO 及以上，
+    避免把调试流全量灌进内存。"""
+    from loguru import logger as _loguru
+    rb = RingBuffer(capacity)
+    rb._id = _loguru.add(rb._sink, level="INFO")
+    return rb
 
 
-def detach(plugin_logger, handler: RingBufferHandler) -> None:
-    plugin_logger.removeHandler(handler)
+def detach(rb: RingBuffer | None) -> None:
+    if rb is None or rb._id is None:
+        return
+    try:
+        from loguru import logger as _loguru
+        _loguru.remove(rb._id)
+    except Exception:
+        pass
+    rb._id = None
 
 
 def build_diagnostics(*, plugin_version: str, astrbot_version: str,

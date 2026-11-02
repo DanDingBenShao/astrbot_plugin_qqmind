@@ -71,12 +71,12 @@
     "hint": "不含回复时附带的最近 10 条群聊历史"
   },
   "group_memory_dir": {
-    "description": "群记忆目录（每群一个 JSON，相对 AstrBot 数据目录）",
+    "description": "群记忆目录（每群一个 JSON，默认相对本插件数据目录 plugin_data）",
     "type": "string",
     "default": "qqmind_group_memory"
   },
   "group_diaries_dir": {
-    "description": "群日记目录（每群一个 SQLite，相对 AstrBot 数据目录）",
+    "description": "群日记目录（每群一个 SQLite，默认相对本插件数据目录 plugin_data）",
     "type": "string",
     "default": "qqmind_group_diaries"
   },
@@ -281,7 +281,7 @@
     "hint": "若平台原始事件带 is_robot 标记会自动识别，这里用于补充"
   },
   "usage_dir": {
-    "description": "每日预算账本目录（相对 AstrBot 数据目录）",
+    "description": "每日预算账本目录（默认相对本插件数据目录 plugin_data）",
     "type": "string",
     "default": "qqmind_usage"
   },
@@ -320,7 +320,7 @@
     "hint": "感情陪伴型调大，省钱型调小"
   },
   "diaries_dir": {
-    "description": "日记库目录（每用户一个 SQLite，相对 AstrBot 数据目录）",
+    "description": "日记库目录（每用户一个 SQLite，默认相对本插件数据目录 plugin_data）",
     "type": "string",
     "default": "qqmind_diaries"
   },
@@ -357,7 +357,7 @@
     "default": ""
   },
   "persona_packs_dir": {
-    "description": "背景故事包目录（相对 AstrBot 数据目录，每包一个 SQLite）",
+    "description": "背景故事包目录（默认相对本插件数据目录 plugin_data，每包一个 SQLite）",
     "type": "string",
     "default": "qqmind_persona_packs"
   },

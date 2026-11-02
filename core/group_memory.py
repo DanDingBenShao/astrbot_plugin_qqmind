@@ -16,6 +16,8 @@ import os
 import time
 from pathlib import Path
 
+from astrbot.api import logger   # 市场规范：日志只走 astrbot.api（v0.3.6 整改）
+
 from .core import est_tokens
 from .diary import DiaryStore
 from .private import PrivateSession, complete_text, complete_text_resp
@@ -119,8 +121,7 @@ class GroupMemory:
         except OSError as e:
             # 路径被目录占位 / 磁盘故障等：落盘失败不能炸消息处理链，
             # 内存态窗口照常工作，路径恢复后下一条消息自动补盘
-            import logging
-            logging.getLogger("astrbot").warning(
+            logger.warning(
                 f"[qqmind] group memory save failed for {self.gid}: {e!r}")
 
     def close(self) -> None:

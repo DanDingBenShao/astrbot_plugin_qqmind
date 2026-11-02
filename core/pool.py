@@ -19,6 +19,8 @@ import re
 import time
 from pathlib import Path
 
+from astrbot.api import logger   # 市场规范：日志只走 astrbot.api（v0.3.6 整改）
+
 BATCH_COMPRESS_PROMPT = (
     "你是群聊记忆整理助手。下面是一段群聊原文（每行前缀 [id] 是消息编号，"
     "群号+说话人已标注）。把这段聊天按**话题**拆分成若干篇日记：同一个话题下"
@@ -186,9 +188,7 @@ class CandidatePool:
                           f, ensure_ascii=False)
             os.replace(tmp, self.path)
         except OSError as e:
-            import logging
-            logging.getLogger("astrbot").warning(
-                f"[qqmind] pool save failed: {e!r}")
+            logger.warning(f"[qqmind] pool save failed: {e!r}")
 
     # ---------- 进出 ----------
     def add(self, ts: float, gid: int, uid: int, nick: str, text: str) -> None:
@@ -215,12 +215,11 @@ class CandidatePool:
             before = self._dropped_total
             self._dropped_total += drop
             if before == 0 or before // 100 != self._dropped_total // 100:
-                import logging
                 gids: dict[int, int] = {}
                 for m in dropped:
                     g = int(m.get("gid") or 0)
                     gids[g] = gids.get(g, 0) + 1
-                logging.getLogger("astrbot").warning(
+                logger.warning(
                     f"[qqmind] pool full ({self.max_msgs}): dropped "
                     f"{drop} oldest msgs (total {self._dropped_total}, "
                     f"gids={gids})")
@@ -264,9 +263,7 @@ class CandidatePool:
             with open(self._pending_path(), "w", encoding="utf-8") as f:
                 json.dump(out, f, ensure_ascii=False)
         except OSError as e:
-            import logging
-            logging.getLogger("astrbot").warning(
-                f"[qqmind] pool pending write failed: {e!r}")
+            logger.warning(f"[qqmind] pool pending write failed: {e!r}")
         return out
 
     def take_all(self) -> list[dict]:

@@ -71,6 +71,16 @@ https://github.com/DanDingBenShao/astrbot_plugin_qqmind
 - `reply_rate_per_min`：每群每分钟回复上限（默认 6，兼风控保护）
 - `allowed_groups`：群白名单，空=不限
 
+## 数据存放（v0.3.6）
+
+所有数据（账本/日记/群记忆/池/角色包）统一存放在 AstrBot 官方插件数据目录：
+
+```
+data/plugin_data/astrbot_plugin_qqmind/
+```
+
+从旧版本升级**无需任何操作**：首次启动自动把 `data/` 根下的老数据整体搬入新目录（支持用户自定义目录名；显式配置了绝对路径的尊重原样）。目录键现在相对本插件数据目录解析。
+
 ## 已知边界
 
 - 全量档逐条判读在极活跃群可能判读开销超过回复开销（bench 数据见上表），重度群建议 layered/advanced

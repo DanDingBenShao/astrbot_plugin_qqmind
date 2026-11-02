@@ -11,6 +11,8 @@ import os
 import time
 from pathlib import Path
 
+from astrbot.api import logger   # 市场规范：日志只走 astrbot.api（v0.3.6 整改）
+
 
 class DailyBudget:
     def __init__(self, path=None, limit: int = 0):
@@ -60,9 +62,7 @@ class DailyBudget:
         except OSError as e:
             # 路径被目录占位 / 磁盘只读等：账本写失败不能拖垮消息处理，
             # 内存态账目照常，恢复后自动落盘
-            import logging
-            logging.getLogger("astrbot").warning(
-                f"[qqmind] budget save failed: {e!r}")
+            logger.warning(f"[qqmind] budget save failed: {e!r}")
 
     def _roll(self) -> None:
         today = time.strftime("%Y-%m-%d")

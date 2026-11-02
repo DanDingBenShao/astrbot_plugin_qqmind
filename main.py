@@ -19,6 +19,7 @@ import os
 import random
 from pathlib import Path
 import re
+import shutil
 import time
 
 from astrbot.api import logger, star
@@ -47,8 +48,20 @@ from .core.proactive import (build_greeting, in_quiet_hours, memory_digest,
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.5"
+PLUGIN_VERSION = "0.3.6"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
+
+# 数据根：官方规定 data/plugin_data/<插件名>（市场规范 2026-11-01 整改）。
+# 老版本数据落在 data/ 根目录，首次运行整体搬进来（_migrate_legacy_data）。
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+def _plugin_data_root() -> str:
+    try:
+        root = os.path.join(get_astrbot_data_path(), "plugin_data", PLUGIN_NAME)
+    except Exception:
+        root = os.path.join("data", "plugin_data", PLUGIN_NAME)
+    os.makedirs(root, exist_ok=True)
+    return root
 
 _PLUGIN_VERSION_ = None  # 版本走 PLUGIN_VERSION
 JUDGE_PROMPT_LEN = est_tokens(JUDGE_PROMPT)   # 判读 system 提示词的 token 数（账单口径）
@@ -242,6 +255,8 @@ class QQMindPlugin(star.Star):
         self._degraded: set[int] = set()
         self._chapters: dict[str, ChapterStore] = {}
         self._import_jobs: dict[str, ImportJob] = {}   # 导入任务表（控制台轮询进度）
+        self._data_root = _plugin_data_root()
+        self._migrate_legacy_data()   # v0.3.6 一次性：老数据从 data/ 根搬入 plugin_data
         usage_dir = self._abs_dir("usage_dir", "qqmind_usage")
         self.budget = DailyBudget(os.path.join(usage_dir, "daily.json"), 0)
         self._hist_lock = asyncio.Lock()
@@ -269,19 +284,60 @@ class QQMindPlugin(star.Star):
         self._register_page_apis()
 
     # ---------- 配置与存储路径 ----------
+    # 六个数据目录键（迁移/白名单共用）；default=老版本相对目录名
+    _DIR_KEYS = (
+        ("usage_dir", "qqmind_usage"),
+        ("diaries_dir", "qqmind_diaries"),
+        ("group_memory_dir", "qqmind_group_memory"),
+        ("group_diaries_dir", "qqmind_group_diaries"),
+        ("pool_dir", "qqmind_pool"),
+        ("persona_packs_dir", "qqmind_persona_packs"),
+    )
+
+    def _migrate_legacy_data(self) -> None:
+        """v0.3.6 一次性迁移（市场规范整改）：v0.3.5 及以前相对目录锚在
+        data/ 根，官方规范要求数据落 data/plugin_data/<插件名>/。
+        首次启动按配置里实际目录名逐个搬入（含用户自定义名，尊重绝对路径）。
+        目标目录已存在则逐文件补缺（半途失败可重入），源搬空才删壳；
+        单目录失败只告警不炸启动。"""
+        for key, default in self._DIR_KEYS:
+            name = str(self._cfg(key, default))
+            if os.path.isabs(name):
+                continue
+            src = os.path.join("data", name)
+            dst = os.path.join(self._data_root, name)
+            if not os.path.isdir(src):
+                continue
+            try:
+                if not os.path.isdir(dst):
+                    shutil.move(src, dst)
+                else:
+                    for fn in os.listdir(src):
+                        s, d = os.path.join(src, fn), os.path.join(dst, fn)
+                        if not os.path.exists(d):
+                            shutil.move(s, d)
+                    if not os.listdir(src):
+                        os.rmdir(src)
+                logger.info(f"[qqmind] 数据已迁入 plugin_data: data/{name} "
+                            f"-> plugin_data/{PLUGIN_NAME}/{name}")
+            except OSError as e:
+                logger.warning(f"[qqmind] data migration failed for {name}: {e!r}")
+
     def _cfg(self, key: str, default=None):
         if self.plugin_config is not None:
             return self.plugin_config.get(key, default)
         return default
 
     def _abs_dir(self, key: str, default: str) -> str:
-        """配置目录 → 绝对路径。相对路径锚定 AstrBot 工作目录（CWD）：
-        历史数据一直落在这里，不能改锚 get_data_dir——那会让老用户的
-        日记/池子原地「消失」。"""
-        import os
+        """配置目录 → 绝对路径。v0.3.6 锚定官方 plugin_data 目录：
+        data/plugin_data/astrbot_plugin_qqmind/<子目录>（市场规范整改）。
+        相对路径语义从「相对 data/ 根」改为「相对本插件数据根」，老数据由
+        _migrate_legacy_data 一次性搬入；用户显式配绝对路径则原样尊重。"""
         d = str(self._cfg(key, default))
-        if not os.path.isabs(d):
-            d = os.path.join("data", d)
+        if os.path.isabs(d):
+            os.makedirs(d, exist_ok=True)
+            return d
+        d = os.path.join(self._data_root, d)
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -1775,6 +1831,12 @@ class QQMindPlugin(star.Star):
         gid = _safe_int_id(event.get_group_id())
         if not gid:
             return
+        # 白名单隔离（v0.3.6 市场整改补漏）：allowed_groups 只在 on_message
+        # 拦消息入口还不够——其他插件对白名单外群发起的 LLM 请求也会进本钩子，
+        # 记忆/人设同样不许注入这些群。
+        allowed = self._cfg("allowed_groups") or []
+        if allowed and str(gid) not in [str(g) for g in allowed]:
+            return
         gnick = (event.get_sender_name() or "").strip() or str(uid)
         # 原生管线的用户消息也可能带引用——主模型必须看得见被引用的那句
         gtext = event.message_str or ""
@@ -2283,32 +2345,54 @@ class QQMindPlugin(star.Star):
 
         # ---------- 数据一键导入（v0.2.6） ----------
 
-        async def api_import_sources():
-            """可导入来源：AstrBot conversations 表里的会话（按用户聚合）。"""
-            import sqlite3
-            db_path = os.path.join("data", "data_v4.db")
-            if not os.path.exists(db_path):
-                return {"status": "ok", "data": {"sources": []}}
+        async def _conversation_rows(user_id: str = None):
+            """经官方数据库接口读会话（市场规范整改：不再直连 data_v4.db）。
+            返回 [(platform_id, user_id, content长度或content, updated_at)]。
+            db 不可用（测试环境/老版本 AstrBot）返回 None。"""
             try:
-                con = sqlite3.connect(db_path)
-                con.row_factory = sqlite3.Row
-                rows = con.execute(
-                    "SELECT platform_id, user_id, LENGTH(content) AS sz, "
-                    "updated_at FROM conversations ORDER BY updated_at DESC "
-                    "LIMIT 200").fetchall()
-                con.close()
-            except sqlite3.Error as e:
-                return {"status": "error", "message": repr(e)}
-            sources = []
+                db = self.context.get_db()
+            except Exception:
+                return None
+            try:
+                convs = await db.get_conversations(user_id=user_id)
+            except Exception as e:
+                logger.warning(f"[qqmind] get_conversations failed: {e!r}")
+                return None
+            out = []
+            for c in convs:
+                content = c.content if isinstance(c.content, list) else None
+                out.append({
+                    "platform_id": c.platform_id,
+                    "user_id": c.user_id,
+                    "size": len(json.dumps(content, ensure_ascii=False))
+                            if content is not None else 0,
+                    "updated_at": str(getattr(c, "updated_at", "") or ""),
+                    "content": content})
+            return out
+
+        async def api_import_sources():
+            """可导入来源：AstrBot conversations 表里的会话（按用户聚合）。
+            v0.3.6 改走官方 get_db().get_conversations()。"""
+            rows = await _conversation_rows()
+            if not rows:
+                return {"status": "ok", "data": {"sources": []}}
+            # 按用户聚合：一个 user_id 一行（同一用户多会话取最近更新时间）
+            latest: dict[str, dict] = {}
             for r in rows:
+                prev = latest.get(r["user_id"])
+                if prev is None or r["updated_at"] > prev["updated_at"]:
+                    latest[r["user_id"]] = r
+            sources = []
+            for r in latest.values():
                 uid_part = str(r["user_id"] or "").split("!")[-1]
                 sources.append({
                     "id": str(r["user_id"] or ""),   # user_id 已含平台前缀，全局唯一
                     "platform": r["platform_id"],
                     "uid": uid_part,
-                    "size": int(r["sz"] or 0),
+                    "size": int(r["size"] or 0),
                     "updated": r["updated_at"]})
-            return {"status": "ok", "data": {"sources": sources}}
+            sources.sort(key=lambda x: x["updated"], reverse=True)
+            return {"status": "ok", "data": {"sources": sources[:200]}}
 
         async def api_import_start():
             """发起导入。四种来源（v0.2.9 全兼容，自动识别）：
@@ -2384,24 +2468,15 @@ class QQMindPlugin(star.Star):
                         "data": {"conversations": len(convs),
                                  "import_ids": ids}}
             if source:
-                import sqlite3
-                db_path = os.path.join("data", "data_v4.db")
-                if not os.path.exists(db_path):
-                    return {"status": "error", "message": "找不到 data_v4.db"}
-                con = sqlite3.connect(db_path)
-                row = con.execute(
-                    "SELECT content FROM conversations WHERE user_id = ?",
-                    (source,)).fetchone()
-                con.close()
-                if not row:
-                    return {"status": "error", "message": f"会话不存在：{source}"}
-                raw = row[0]
-                if isinstance(raw, str):
-                    try:
-                        raw = json.loads(raw)
-                    except json.JSONDecodeError:
-                        return {"status": "error",
-                                "message": "会话内容不是合法 JSON"}
+                rows = await _conversation_rows(user_id=source)
+                raw = None
+                for r in rows or []:
+                    if str(r["user_id"]) == str(source):
+                        raw = r["content"]
+                        break
+                if raw is None:
+                    return {"status": "error",
+                            "message": f"会话不存在或数据库不可用：{source}"}
             else:
                 raw = payload.get("messages")
                 if raw is None:

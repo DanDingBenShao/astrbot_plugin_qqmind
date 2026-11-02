@@ -3,6 +3,7 @@ display_name: Token消耗高级优化（QQ机器人套件）
 short_desc: Token消耗高级优化——判读/记忆/回复全链路省 token，附赠四轴群聊记忆 + 私聊日记 + 三层人设
 desc: |
   Token消耗高级优化（QQ机器人套件）：为 AstrBot 省下每一分 token 钱，作者：本少。
+  更多教程与演示 → B站主页 https://space.bilibili.com/411821291
 
   【省钱主线】判读不带语境只判待判消息（账单实测省六成）、判读/压缩自动走
   非思考副本、回复逐字语境条数可控（reply_context_messages）、每日 token
@@ -18,6 +19,7 @@ desc: |
   【护栏】每日预算熔断、每群频率上限、@全体忽略、bot 互怼拦截、主动私信多重护栏。
 version: 0.3.7
 author: 本少 (DanDingBenShao)
+social_link: https://space.bilibili.com/411821291
 repo: https://github.com/DanDingBenShao/astrbot_plugin_qqmind
 astrbot_version: ">=4.29.0"
 support_platforms:

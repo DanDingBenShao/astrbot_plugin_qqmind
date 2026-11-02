@@ -49,7 +49,7 @@ from .core.proactive import (build_greeting, in_quiet_hours, memory_digest,
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.7"
+PLUGIN_VERSION = "0.3.8"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 # 数据根：官方规定 data/plugin_data/<插件名>（市场规范 2026-11-01 整改）。

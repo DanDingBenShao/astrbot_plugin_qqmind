@@ -534,9 +534,6 @@
     } catch (e) { box.textContent = '加载失败：' + e.message; }
   }
   loadSwitches();
-  };
-  $('sw-new-gid').addEventListener('keydown', e => { if (e.key === 'Enter') $('sw-add').click(); });
-  loadSwitches();
 
   // ---------------- 一对一 ----------------
   async function loadBudget() {

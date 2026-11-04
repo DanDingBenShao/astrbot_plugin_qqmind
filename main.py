@@ -172,6 +172,7 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
         self.judge_limiter = RateLimiter(int(self._cfg("max_judged_per_min", 30)))
         self._runtime: dict[int, dict] = {}
         self._bot_names: dict[int, str] = {}
+        self._group_names: dict[int, str] = {}   # 群名缓存（控制台懒查）
         self._poke_last: dict[tuple[int, int], float] = {}   # (gid,uid)->上次反应
         self._judge_fail: dict[int, int] = {}
         self._degraded: set[int] = set()

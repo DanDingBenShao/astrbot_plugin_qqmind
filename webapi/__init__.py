@@ -98,18 +98,86 @@ def _norm_switches(switches) -> dict:
     return out
 
 
-@route("/group_switches", ["GET"], "群开关列表（含各群最近消息时间）")
+@route("/group_switches", ["GET"], "群开关列表（群名+今日回复数+活跃排序）")
 async def api_get_switches(p):
     sw = _norm_switches((p.plugin_config or {}).get("group_switches"))
-    # 已知群（缓冲里有活动的）补上下文，方便认出「哪个群号是哪个群」
+    # 聚合每个群的展示信息：群名（懒查缓存）/ 今日回复数 / 今日判读数 /
+    # 最后活跃时间（_rt 里 on_message 刷的 last_msg）
+    rows = []
+    now = time.time()
+    gids: set[int] = set()
     try:
-        known = sorted(str(g) for g in getattr(p.group_buffer, "buf", {}).keys())
+        gids |= {int(g) for g in getattr(p.group_buffer, "buf", {}).keys()}
     except Exception:
-        known = []
-    return {"status": "ok", "data": {"switches": sw, "known_groups": known}}
+        pass
+    try:
+        gids |= {int(g) for g in getattr(p, "_STATS_G", {}).keys()}
+    except Exception:
+        pass
+    try:
+        gids |= {int(g) for g in sw.keys() if str(g).isdigit()}
+    except Exception:
+        pass
+    names = getattr(p, "_group_names", {})
+    stats_g = getattr(p, "_STATS_G", {})
+    rts = getattr(p, "_runtime", {})
+    for gid in gids:
+        st = stats_g.get(int(gid), {}) or {}
+        rt = rts.get(int(gid), {}) or {}
+        rows.append({
+            "gid": str(gid),
+            "name": names.get(int(gid), ""),
+            "replied": int(st.get("replied", 0)),
+            "judged": int(st.get("judged", 0)),
+            "last_active_ago": (int(now - rt["last_msg"])
+                                if rt.get("last_msg") else None),
+            "mode": sw.get(str(gid), "default"),
+        })
+    # 排序：有回复的群最前（今日回复数降序），其次判读过的，再按最后活跃；
+    # 全零的群垫底按群号
+    rows.sort(key=lambda r: (-r["replied"], -r["judged"],
+                             r["last_active_ago"] if r["last_active_ago"]
+                             is not None else 1 << 60,
+                             int(r["gid"])))
+    return {"status": "ok", "data": {"groups": rows}}
 
 
-@route("/group_switches", ["POST"], "写单个群开关 {gid, mode}")
+async def _group_display_name(p, gid: int) -> str:
+    """群名懒查（get_group_info，需一次调用），缓存进 p._group_names。"""
+    names = getattr(p, "_group_names", None)
+    if names is None:
+        return ""
+    if gid in names:
+        return names[gid]
+    rt = getattr(p, "_runtime", {}).get(int(gid), {}) or {}
+    bot = rt.get("bot")
+    me = str(rt.get("self_id") or "")
+    name = ""
+    if bot is not None and hasattr(bot, "call_action") and me:
+        try:
+            info = await bot.call_action("get_group_info", self_id=int(me),
+                                         group_id=int(gid))
+            if isinstance(info, dict):
+                name = (info.get("group_name") or "").strip()
+        except Exception as e:
+            logger.debug(f"[qqmind] group info lookup failed for {gid}: {e!r}")
+    if name:
+        names[int(gid)] = name
+    return name
+
+
+@route("/group_names", ["GET"], "批量补全群名（懒查缓存，逐群一次 API）")
+async def api_group_names(p):
+    payload_q = _web_request.query_param("gids", default="") \
+        if hasattr(_web_request, "query_param") else ""
+    gids = [int(g) for g in str(payload_q).split(",") if g.strip().isdigit()]
+    out = {}
+    for gid in gids[:50]:
+        out[str(gid)] = await _group_display_name(p, gid)
+    return {"status": "ok", "data": {"names": out}}
+
+
+@route("/group_switches/set", ["POST"], "写单个群开关 {gid, mode}")
 async def api_set_switch(p):
     payload = await _web_request.json(default={}) or {}
     gid = str(payload.get("gid", "")).strip()

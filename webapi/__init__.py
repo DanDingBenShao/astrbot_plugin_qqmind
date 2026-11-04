@@ -86,6 +86,53 @@ async def api_set_config(p):
     return {"status": "ok"}
 
 
+# ---------- 群开关（v0.3.10） ----------
+
+def _norm_switches(switches) -> dict:
+    """规范化开关字典 → {群号str: off|at_only|default}，非法值丢弃。"""
+    out = {}
+    if isinstance(switches, dict):
+        for k, v in switches.items():
+            if v in ("off", "at_only", "default"):
+                out[str(k)] = v
+    return out
+
+
+@route("/group_switches", ["GET"], "群开关列表（含各群最近消息时间）")
+async def api_get_switches(p):
+    sw = _norm_switches((p.plugin_config or {}).get("group_switches"))
+    # 已知群（缓冲里有活动的）补上下文，方便认出「哪个群号是哪个群」
+    try:
+        known = sorted(str(g) for g in getattr(p.group_buffer, "buf", {}).keys())
+    except Exception:
+        known = []
+    return {"status": "ok", "data": {"switches": sw, "known_groups": known}}
+
+
+@route("/group_switches", ["POST"], "写单个群开关 {gid, mode}")
+async def api_set_switch(p):
+    payload = await _web_request.json(default={}) or {}
+    gid = str(payload.get("gid", "")).strip()
+    mode = payload.get("mode")
+    if not gid.isdigit() or mode not in ("off", "at_only", "default"):
+        return {"status": "error", "message": "参数：gid(群号) + mode(off|at_only|default)"}
+    c = p.plugin_config
+    if c is None:
+        return {"status": "error", "message": "config unavailable"}
+    sw = _norm_switches(c.get("group_switches"))
+    if mode == "default":
+        sw.pop(gid, None)          # default=恢复跟随全局，直接删键
+    else:
+        sw[gid] = mode
+    c["group_switches"] = sw
+    try:
+        c.save_config()
+    except Exception as e:
+        logger.warning(f"[qqmind] save switches failed: {e!r}")
+        return {"status": "error", "message": f"保存失败：{e!r}"}
+    return {"status": "ok", "data": {"switches": sw}}
+
+
 # ---------- 诊断 ----------
 
 @route("/diagnostics", ["GET"], "qqmind 一键诊断包")

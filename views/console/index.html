@@ -153,7 +153,19 @@
   <button class="tab on" data-pane="p1">一对一对话</button>
   <button class="tab" data-pane="p2">群聊</button>
   <button class="tab" data-pane="p3">人设卡</button>
+  <button class="tab" data-pane="p4">群开关</button>
 </div>
+<!-- ================= 群开关 ================= -->
+<div class="pane" id="p4">
+  <h3>群开关</h3>
+  <p class="hint">off=不读不回（完全隐身） · at_only=仅@我·引用我·戳我才回 · default=跟随全局套餐。即点即存，立即生效。</p>
+  <div style="display:flex; gap:10px; margin:12px 0">
+    <input type="text" id="sw-new-gid" placeholder="输入群号添加（可先于机器人进群设置）" style="flex:1">
+    <button class="save" id="sw-add">添加群</button>
+  </div>
+  <div class="list" id="sw-list">加载中…</div>
+</div>
+
 <div class="promo-footer">
   Token消耗高级优化（QQ机器人套件）· 作者 <b>本少</b> ·
   B站教程与演示 → <a href="https://space.bilibili.com/411821291" target="_blank" rel="noopener">本少-淡定版</a> ·
@@ -448,6 +460,68 @@
         p.classList.toggle('on', p.id === t.dataset.pane));
     };
   });
+
+  // ---------------- 群开关（v0.3.10） ----------------
+  const SW_MODES = [
+    ['default', '跟随全局'],
+    ['at_only', '仅@才回'],
+    ['off', '关闭'],
+  ];
+  async function loadSwitches() {
+    const box = $('sw-list');
+    try {
+      const r = await api.apiGet('group_switches');
+      const sw = r.switches || {};
+      const known = r.known_groups || [];
+      const gids = Array.from(new Set([...Object.keys(sw), ...known, ...($('sw-new-gid').dataset.pending ? [$('sw-new-gid').dataset.pending] : [])]));
+      gids.sort();
+      if (!gids.length) { box.textContent = '还没有已知群。上面输入群号添加，或等机器人进群后自动出现。'; return; }
+      box.innerHTML = '';
+      for (const gid of gids) {
+        const cur = sw[gid] || 'default';
+        const row = document.createElement('div');
+        row.className = 'user-item';
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid var(--line)';
+        const name = document.createElement('b');
+        name.textContent = gid;
+        name.style.minWidth = '120px';
+        row.appendChild(name);
+        for (const [mode, label] of SW_MODES) {
+          const btn = document.createElement('button');
+          btn.textContent = label;
+          btn.className = 'save';
+          btn.style.cssText = 'margin:0;padding:4px 10px;font-size:12.5px';
+          if (cur === mode) { btn.style.opacity = '1'; btn.style.fontWeight = '700'; btn.style.outline = '2px solid var(--accent)'; }
+          else btn.style.opacity = '0.55';
+          btn.onclick = async () => {
+            btn.disabled = true;
+            try {
+              await api.apiPost('group_switches', { gid, mode });
+              $('sw-new-gid').removeAttribute('data-pending');
+              await loadSwitches();
+            } catch (e) { alert('保存失败：' + e.message); btn.disabled = false; }
+          };
+          row.appendChild(btn);
+        }
+        const del = document.createElement('span');
+        del.textContent = '×';
+        del.title = '从列表移除（不影响已保存的开关）';
+        del.style.cssText = 'cursor:pointer;color:var(--muted);margin-left:auto;font-size:16px';
+        del.onclick = () => { row.remove(); };
+        row.appendChild(del);
+        box.appendChild(row);
+      }
+    } catch (e) { box.textContent = '加载失败：' + e.message; }
+  }
+  $('sw-add').onclick = () => {
+    const gid = ($('sw-new-gid').value || '').trim();
+    if (!/^[0-9]{5,}$/.test(gid)) { alert('请输入正确的群号（5位以上数字）'); return; }
+    $('sw-new-gid').dataset.pending = gid;
+    $('sw-new-gid').value = '';
+    loadSwitches();
+  };
+  $('sw-new-gid').addEventListener('keydown', e => { if (e.key === 'Enter') $('sw-add').click(); });
+  loadSwitches();
 
   // ---------------- 一对一 ----------------
   async function loadBudget() {

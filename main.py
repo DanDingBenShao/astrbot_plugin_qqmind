@@ -116,7 +116,7 @@ _CONFIG_KEYS = (
     "max_judged_per_min", "max_judged_per_round",
     "judge_model", "think_model",
     "judge_no_think", "compress_no_think",
-    "judge_fail_threshold", "bot_qq_ids", "allowed_groups",
+    "judge_fail_threshold", "bot_qq_ids", "allowed_groups", "group_switches",
     "group_flat_messages", "group_shallow_messages", "group_context_messages",
     "reply_context_messages", "judge_context_messages",
     "memory_layering", "precise_memory", "precise_budget_tokens",

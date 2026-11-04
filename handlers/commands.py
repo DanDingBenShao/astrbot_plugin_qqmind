@@ -48,12 +48,19 @@ class CommandsMixin:
         n_mem = len(self.memories)
         n_priv = len(self.privates)
         diaries = self.privates[uid].diary.count() if uid in self.privates else 0
+        gid = _safe_int_id(event.get_group_id())
+        switch_note = ""
+        if gid:
+            sw = self._group_switch(gid)
+            if sw != "default":
+                switch_note = f" | 本群开关：{sw}"
         b = self._budget().snapshot()
         budget_line = ("今日 token：不限" if b["limit"] <= 0
                        else f"今日 token：{b['used']}/{b['limit']}")
         yield event.plain_result(
             f"群聊记忆体 v{_plugin_version()}\n"
-            f"群聊套餐：{normalize_preset(self._cfg('group_preset', 'light'))}\n"
+            f"群聊套餐：{normalize_preset(self._cfg('group_preset', 'light'))}"
+            f"{switch_note}\n"
             f"群聊记忆：{n_mem} 个群\n"
             f"私聊会话：{n_priv} 人\n"
             f"你的日记：{diaries} 篇\n"
@@ -151,3 +158,53 @@ class CommandsMixin:
             out = gm.diary.search(arg)
         out += "\n（▷=存有原话，看原话发：/群日记 #编号；日记全群共用）"
         yield event.plain_result(out)
+
+    async def cmd_group_switch_impl(self, event: AstrMessageEvent):
+        """群开关三态管理：/群开关 查看 | /群开关 off|at_only|default [群号]
+
+        off=不读不回（完全隐身）；at_only=仅@我·引用我·戳我才回；
+        default=跟随全局套餐与白名单。改当前群可省群号；改别的群要管理员。
+        开关配置落盘走 AstrBotConfig.save_config()（面板可见可改）。"""
+        arg = (event.message_str or "").strip()
+        parts = arg.split()
+        action = ""
+        target_gid = 0
+        cur_gid = _safe_int_id(event.get_group_id())
+        for tok in parts:
+            tl = tok.lower()
+            if tl in ("off", "at_only", "default", "关", "仅@"):
+                action = {"关": "off", "仅@": "at_only"}.get(tl, tl)
+            elif tok.isdigit() and len(tok) >= 5:
+                target_gid = int(tok)
+        gid = target_gid or cur_gid
+        if not gid:
+            help_text = " / ".join([
+                "/群开关 看本群状态",
+                "/群开关 off 本群关闭(不读不回)",
+                "/群开关 at_only 仅@才回",
+                "/群开关 default 跟随全局",
+                "/群开关 off 123456 指定群(需管理员)"])
+            yield event.plain_result("群开关用法：" + help_text)
+            return
+        is_admin = bool(getattr(event, "is_admin", lambda: False)())
+        if target_gid and target_gid != cur_gid and not is_admin:
+            yield event.plain_result("改别的群需要管理员权限哦")
+            return
+        switches = dict(self._cfg("group_switches") or {})
+        if not action:
+            cur = switches.get(str(gid), "default（未设置）")
+            yield event.plain_result(
+                f"群 {gid} 的开关：{cur}"
+                + "（off=不读不回 | at_only=仅@才回 | default=跟随全局）")
+            return
+        switches[str(gid)] = action
+        try:
+            self.plugin_config["group_switches"] = switches
+            self.plugin_config.save_config()
+        except Exception as e:
+            yield event.plain_result(f"开关保存失败：{e!r}")
+            return
+        label = {"off": "已关闭（不读不回，完全隐身）",
+                 "at_only": "已设为仅@模式（@我·引用我·戳我 才回，其余不读）",
+                 "default": "已恢复跟随全局（白名单+套餐照常）"}[action]
+        yield event.plain_result(f"群 {gid} {label}")

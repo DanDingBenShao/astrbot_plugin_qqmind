@@ -70,6 +70,7 @@ https://github.com/DanDingBenShao/astrbot_plugin_qqmind
 - `daily_token_budget`：每日预算，0 不限
 - `reply_rate_per_min`：每群每分钟回复上限（默认 6，兼风控保护）
 - `allowed_groups`：群白名单，空=不限
+- `group_switches`（v0.3.10）：群开关，每群三态——`off`=不读不回（完全隐身）、`at_only`=仅@我·引用我·戳我才回、`default`=跟随全局；未列出的群跟全局。群里直接发 `/群开关 off|at_only|default` 改本群，跨群管理 `/群开关 off 群号`（需管理员），配置自动落盘面板可见
 
 ## 数据存放（v0.3.6）
 

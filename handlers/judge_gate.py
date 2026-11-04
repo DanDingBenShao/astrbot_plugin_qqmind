@@ -60,6 +60,7 @@ class JudgeGateMixin:
         self_id = str(event.get_self_id() or "")
         if not gid or not uid or str(uid) == self_id:
             return
+        key = (gid, uid)
         if self._is_bot(uid, event):
             # bot 消息（防互怼）：qqmind 不理，也不许主模型理
             event.should_call_llm(True)
@@ -67,6 +68,38 @@ class JudgeGateMixin:
         allowed = self._cfg("allowed_groups") or []
         if allowed and str(gid) not in [str(g) for g in allowed]:
             # 白名单外：qqmind 完全隐身，既不判读也不碰任何标志
+            return
+        switch = self._group_switch(gid)
+        if switch == "off":
+            # 群开关=关：不读不回，完全隐身（与白名单外同路径）
+            return
+        if switch == "at_only":
+            # 仅@模式：只有 @我/引用我/戳我 才走后续；其余消息不读不判
+            # （戳自己另有独立路径，在上面已分流，这里不会误伤）
+            wake_probe = detect_wake((event.message_str or "").strip(),
+                                     event.get_messages() or [], self_id, [])
+            if not wake_probe.at_me:
+                return
+            # @/引用我：必回，开监控期直接放行主模型（与 wake.at_me 主路径一致）
+            self._degraded.discard(gid)
+            self._judge_fail.pop(gid, None)
+            nick = (event.get_sender_name() or "").strip() or str(uid)
+            text = await self._vision_annotate(
+                event, (event.message_str or "").strip())
+            self._note_group(gid, f"{nick}({uid})", text or "[图片]")
+            rt = self._rt(gid)
+            rt["origin"] = event.unified_msg_origin
+            rt["bot"] = getattr(event, "bot", None)
+            rt["self_id"] = self_id
+            rt["last_msg"] = time.time()
+            self._record_incoming(gid, uid, f"{nick}({uid})", text)
+            self._cancel_batch(gid)
+            s = MonitorSession(followup_rounds=int(self._cfg("followup_rounds", 3)),
+                               idle_timeout_min=5)
+            self.sessions[key] = s
+            if self._cfg("affinity_enabled", False):
+                self._affection.add(uid, 2)
+            logger.info(f"[qqmind] at_only wake for {uid} in group {gid}")
             return
         # 戳一戳（v0.2.12）：Poke 组件 target_id=自己 → 独立反应路径
         if _is_poke_self(event.get_messages() or [], self_id):
@@ -125,7 +158,6 @@ class JudgeGateMixin:
             event.should_call_llm(True)
             return
 
-        key = (gid, uid)
         if wake.at_me:
             # @/引用我 必回：丢掉待回复批，开监控期并直接放行给主模型
             self._degraded.discard(gid)

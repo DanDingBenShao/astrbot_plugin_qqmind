@@ -49,7 +49,7 @@ from .core.proactive import (build_greeting, in_quiet_hours, memory_digest,
 from .core.affection import in_schedule, profile_to_prompt
 from .core.private import complete_text, complete_text_resp
 
-PLUGIN_VERSION = "0.3.8"
+PLUGIN_VERSION = "0.3.10"
 PLUGIN_NAME = "astrbot_plugin_qqmind"
 
 # 数据根：官方规定 data/plugin_data/<插件名>（市场规范 2026-11-01 整改）。
@@ -716,6 +716,18 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
     def _read_mode(self) -> str:
         return resolve_read_mode(self._cfg("group_preset", "light"),
                                  self._cfg("read_mode", "batch"))
+
+    def _group_switch(self, gid: int) -> str:
+        """群开关三态：off=不读不回 / at_only=仅@才回 / default=跟随全局。
+
+        配置键 group_switches：{"群号": "off|at_only|default"}；未列出=default。
+        键容忍 int/str（WebUI 面板可能写成数字）。非法值按 default 处理。"""
+        switches = self._cfg("group_switches") or {}
+        try:
+            raw = switches.get(str(gid), switches.get(int(gid), "default"))
+        except Exception:
+            return "default"
+        return raw if raw in ("off", "at_only", "default") else "default"
 
     def _rt(self, gid: int) -> dict:
         return self._runtime.setdefault(int(gid), {
@@ -1389,4 +1401,9 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
     @filter.command("群日记")
     async def cmd_group_diary(self, event: AstrMessageEvent):
         async for r in self.cmd_group_diary_impl(event):
+            yield r
+
+    @filter.command("群开关")
+    async def cmd_group_switch(self, event: AstrMessageEvent):
+        async for r in self.cmd_group_switch_impl(event):
             yield r

@@ -379,6 +379,12 @@
       "type": "string"
     }
   },
+  "group_switches": {
+    "description": "群开关（每群三态，未列出的群跟随全局）",
+    "type": "object",
+    "default": {},
+    "hint": "键=群号（字符串），值：off=不读不回（完全隐身）/ at_only=仅@我·引用我·戳我才回，其余不读 / default=跟随全局套餐与白名单。管理指令：/群开关 <群号> off|at_only|default"
+  },
   "memory_prompt_budget": {
     "description": "记忆注入硬预算（token，超出按优先级裁剪）",
     "type": "int",

@@ -17,7 +17,7 @@ desc: |
 
   【人设】浅层状态 + 深层性格常驻，背景故事按篇章库管理（标题常驻、正文召回）。
   【护栏】每日预算熔断、每群频率上限、@全体忽略、bot 互怼拦截、主动私信多重护栏。
-version: 0.3.8
+version: 0.3.10
 author: 本少 (DanDingBenShao)
 social_link: https://space.bilibili.com/411821291
 repo: https://github.com/DanDingBenShao/astrbot_plugin_qqmind

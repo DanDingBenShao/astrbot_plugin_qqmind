@@ -538,6 +538,7 @@ def register(plugin) -> None:
     from .. import main as _m
     globals()["_safe_int_id"] = _m._safe_int_id
     globals()["_short_title"] = _m._short_title
+    globals()["_CONFIG_KEYS"] = _m._CONFIG_KEYS
     import functools
     for path, fn, methods, desc in _API_ROUTES:
         bound = functools.partial(fn, plugin)

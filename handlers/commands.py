@@ -186,7 +186,8 @@ class CommandsMixin:
                 "/群开关 off 123456 指定群(需管理员)"])
             yield event.plain_result("群开关用法：" + help_text)
             return
-        is_admin = bool(getattr(event, "is_admin", lambda: False)())
+        admin_raw = getattr(event, "is_admin", False)
+        is_admin = admin_raw() if callable(admin_raw) else bool(admin_raw)
         if target_gid and target_gid != cur_gid and not is_admin:
             yield event.plain_result("改别的群需要管理员权限哦")
             return
